@@ -2,28 +2,34 @@ package avuuna.player.controller;
 
 import avuuna.player.exception.PlayerException;
 import avuuna.player.model.MusicPlayer;
+import avuuna.player.model.SessionStore;
+import avuuna.player.model.SessionStore.Session;
 import avuuna.player.model.Song;
 import avuuna.player.utils.ModelObserver;
 import avuuna.player.utils.Strings;
 import avuuna.player.utils.Utils;
 import avuuna.player.view.GUIPlayer;
+import avuuna.player.view.GUIPlayer.PlaylistItem;
 import javazoom.jl.player.basic.BasicPlayerEvent;
 import javazoom.jl.player.basic.BasicPlayerException;
 
 import javax.swing.*;
-import java.awt.event.InputEvent;
-import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
+import java.io.IOException;
 import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.stream.Stream;
 
 /**
  * MVC Controller. Wires user actions from the view to the model and reflects
@@ -32,12 +38,22 @@ import java.util.Set;
 public class PlayerController implements Serializable, ModelObserver {
     private static final long serialVersionUID = 232492703123683857L;
 
+    private static final int PROGRESS_REFRESH_MS = 200;
+    /** "Previous" restarts the current song when it has played longer than this. */
+    private static final long RESTART_THRESHOLD_US = 3_000_000L;
+    /** Step for Shift+Left / Shift+Right seeking. */
+    private static final long SEEK_STEP_US = 5_000_000L;
+    private static final int MAX_FOLDER_DEPTH = 10;
+
     private static PlayerController controller = null;
 
     private final MusicPlayer model;
     private final GUIPlayer view;
+    private final transient SessionStore sessionStore;
 
     private boolean running;
+    /** True while the user is dragging on the progress bar, so the timer doesn't fight it. */
+    private boolean scrubbing;
 
     public static PlayerController getInstance() {
         if (controller == null) {
@@ -48,8 +64,13 @@ public class PlayerController implements Serializable, ModelObserver {
 
     private PlayerController() {
         model = MusicPlayer.getInstance();
+        // Audio-library callbacks (e.g. end of song) arrive on background threads;
+        // run them on the EDT so model state and Swing are only touched from one thread.
+        model.setEventExecutor(SwingUtilities::invokeLater);
         view = new GUIPlayer();
+        sessionStore = new SessionStore();
         bindActions();
+        bindShortcuts();
     }
 
     /**
@@ -60,139 +81,106 @@ public class PlayerController implements Serializable, ModelObserver {
         running = false;
         model.addObserver(this);
 
+        Runnable exit = () -> {
+            saveSession();
+            onClose.run();
+        };
         view.addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                onClose.run();
+                exit.run();
             }
         });
+        view.addExitMenuListener(e -> exit.run());
 
-        startProgressThread();
+        restoreSession();
+        update();
+        startProgressTimer();
         view.initView();
     }
 
-    private void startProgressThread() {
-        Thread progressThread = new Thread(() -> {
-            while (true) {
-                if (model.getCurrentSong() != null) {
-                    view.setProgressValue((int) model.getProgressBytes());
-                    try {
-                        view.setProgressText(Utils.formatTime(model.getProgressTime())
-                                + Strings.OF + Utils.formatTime(model.getCurrentSong().getDuration()));
-                    } catch (Exception ex) {
-                        Utils.display("Exception in progress thread: " + ex.getMessage());
-                    }
-                } else {
-                    view.setProgressValue(0);
-                    view.setProgressText(Strings.ZERO_TIME);
-                }
-            }
-        });
-        progressThread.start();
-    }
+    // -------------------------------------------------------------------------
+    // Wiring
+    // -------------------------------------------------------------------------
 
     private void bindActions() {
-        view.setOpenMenuAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_MASK));
+        view.setOpenMenuAccelerator(KeyStroke.getKeyStroke("ctrl O"));
+        view.setOpenFolderMenuAccelerator(KeyStroke.getKeyStroke("ctrl shift O"));
         view.addOpenMenuListener(e -> openSongDialog());
+        view.addOpenFolderMenuListener(e -> openFolderDialog());
+        view.addShortcutsMenuListener(e -> view.showShortcutsDialog());
+        view.addAboutMenuListener(e -> view.showAboutDialog());
         view.addAddSongListener(e -> openSongDialog());
 
-        view.addPlayListener(e -> {
-            if (view.isShowingPause()) {
-                pauseSong();
-            } else if (!running && model.getCurrentSong() != null) {
-                playSong();
-            } else if (running) {
-                resumeSong();
-            }
-        });
-
+        view.addPlayListener(e -> togglePlayPause());
         view.addStopListener(e -> stopSong());
         view.addNextListener(e -> nextSong());
         view.addPrevListener(e -> previousSong());
-
-        view.addRepeatListener(e -> {
-            Boolean current = model.getRepeatMode();
-            Boolean nextValidation = Boolean.TRUE.equals(current) ? Boolean.FALSE : null;
-            Boolean next = (current == null) ? Boolean.TRUE : nextValidation;
-            model.setRepeatMode(next);
-        });
-
-        view.addShuffleListener(e -> model.setRandomMode(!model.isRandomMode()));
-
+        view.addRepeatListener(e -> cycleRepeat());
+        view.addShuffleListener(e -> toggleShuffle());
         view.addVolumeChangeListener(e -> setVolume());
 
-        view.addProgressClickListener(new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent e) {
-                if (model.getCurrentSong() == null) return;
-                double ratio = (double) e.getX() / e.getComponent().getWidth();
-                long targetBytes = (long) (ratio * model.getCurrentSong().getBytesLength());
-                try {
-                    model.seek(targetBytes);
-                } catch (BasicPlayerException ex) {
-                    Utils.display("Seek error: " + ex.getMessage());
-                }
-            }
-        });
+        view.addSeekListener(this::previewSeek, this::commitSeek);
+        view.setFileDropHandler(this::addFiles);
 
         view.addSongListMouseListener(new MouseAdapter() {
             @Override
             public void mouseClicked(MouseEvent evt) {
-                if (evt.getClickCount() == 2) {
-                    String selected = view.getSelectedValue();
-                    if (selected != null && !selected.contains(Strings.CURRENT_MARKER)) {
-                        int sel = view.getSelectedIndex();
-                        openSong(selected);
-                        model.clearShuffleHistory();
-                        view.setSelectedIndex(sel);
+                if (evt.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(evt)) {
+                    int index = view.getPlaylistIndexAt(evt.getPoint());
+                    if (index >= 0) {
+                        playSongAt(index);
                     }
                 }
             }
         });
-
-        view.addRemoveSongListener(e -> {
-            if (model.getSongCount() == 0) {
-                JOptionPane.showMessageDialog(null, PlayerException.ERROR_NO_SONGS_LIST,
-                        PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-            List<String> selected = view.getSelectedValues();
-            if (selected.isEmpty()) {
-                JOptionPane.showMessageDialog(null, PlayerException.ERROR_NO_SONG_SELECTED,
-                        PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-            int confirmed = JOptionPane.showConfirmDialog(view, Strings.CONFIRM_REMOVE_MSG,
-                    Strings.CONFIRM_TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE, null);
-            if (confirmed == JOptionPane.YES_OPTION) {
-                int firstIdx = view.getSelectedIndices()[0];
-                for (String name : selected) {
-                    removeSong(name.replace(Strings.CURRENT_MARKER, ""));
-                }
-                int remaining = model.getSongCount();
-                if (remaining > 0) {
-                    view.setSelectedIndex(Math.min(firstIdx, remaining - 1));
-                }
+        view.addSongListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                refreshControlState();
             }
         });
 
-        view.addClearPlaylistListener(e -> {
-            if (model.getSongCount() > 0) {
-                if (!view.isPlaylistEmpty()) {
-                    int confirmed = JOptionPane.showConfirmDialog(view, Strings.CONFIRM_CLEAR_MSG,
-                            Strings.CONFIRM_TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE, null);
-                    if (confirmed == JOptionPane.YES_OPTION) {
-                        clearPlaylist();
-                    }
-                }
-            } else {
-                JOptionPane.showMessageDialog(null, PlayerException.ERROR_NO_SONGS_LIST,
-                        PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-            }
-        });
-
+        view.addRemoveSongListener(e -> removeSelected());
+        view.addClearPlaylistListener(e -> clearPlaylist());
         view.addMoveUpListener(e -> moveSelection(-1));
         view.addMoveDownListener(e -> moveSelection(+1));
+    }
+
+    private void bindShortcuts() {
+        view.bindShortcut(KeyStroke.getKeyStroke("SPACE"), "playPause", this::togglePlayPause);
+        view.bindShortcut(KeyStroke.getKeyStroke("ENTER"), "playSelected", this::playSelected);
+        view.bindShortcut(KeyStroke.getKeyStroke("DELETE"), "removeSelected", this::removeSelected);
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl LEFT"), "previous", this::previousSong);
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl RIGHT"), "next", this::nextSong);
+        view.bindShortcut(KeyStroke.getKeyStroke("shift LEFT"), "seekBack", () -> seekBy(-SEEK_STEP_US));
+        view.bindShortcut(KeyStroke.getKeyStroke("shift RIGHT"), "seekForward", () -> seekBy(SEEK_STEP_US));
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl UP"), "moveUp", () -> moveSelection(-1));
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl DOWN"), "moveDown", () -> moveSelection(+1));
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl R"), "repeat", this::cycleRepeat);
+        view.bindShortcut(KeyStroke.getKeyStroke("ctrl S"), "shuffle", this::toggleShuffle);
+    }
+
+    /**
+     * Refreshes the progress bar periodically on the EDT. A Swing Timer replaces the
+     * former busy-wait thread, which pinned a CPU core and touched Swing off the EDT.
+     */
+    private void startProgressTimer() {
+        new Timer(PROGRESS_REFRESH_MS, e -> refreshProgress()).start();
+    }
+
+    private void refreshProgress() {
+        if (scrubbing) {
+            return;
+        }
+        Song current = model.getCurrentSong();
+        if (current != null) {
+            view.setProgressValue((int) model.getProgressBytes());
+            view.setProgressText(Utils.formatTime(model.getProgressTime())
+                    + Strings.OF + Utils.formatTime(current.getDuration()));
+        } else {
+            view.setProgressValue(0);
+            view.setProgressText(Strings.ZERO_TIME);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -201,7 +189,12 @@ public class PlayerController implements Serializable, ModelObserver {
 
     @Override
     public void update() {
-        if (model.getCurrentSong() != null) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(this::update);
+            return;
+        }
+        Song current = model.getCurrentSong();
+        if (current != null) {
             switch (model.getCurrentEvent()) {
                 case BasicPlayerEvent.RESUMED:
                     view.setPlayingState(true);
@@ -218,11 +211,12 @@ public class PlayerController implements Serializable, ModelObserver {
                     running = false;
                     break;
                 case BasicPlayerEvent.OPENED:
-                    view.setSongLabel(model.getCurrentSong().getName());
-                    view.setProgressMax((int) model.getCurrentSong().getBytesLength());
-                    view.setProgressText(Strings.ZERO + Strings.OF
-                            + Utils.formatTime(model.getCurrentSong().getDuration()));
-                    if (!running) {
+                    view.setSongLabel(displayTitle(current));
+                    view.setProgressMax((int) current.getBytesLength());
+                    view.setProgressText(Strings.ZERO + Strings.OF + Utils.formatTime(current.getDuration()));
+                    if (!model.shouldAutoPlay()) {
+                        view.setPlayingState(false);
+                    } else if (!running) {
                         playSong();
                     }
                     setVolume();
@@ -231,56 +225,204 @@ public class PlayerController implements Serializable, ModelObserver {
                     break;
             }
         } else {
+            running = false;
             view.setSongLabel(null);
             view.setProgressMax(0);
+            view.setPlayingState(false);
         }
 
         view.setRepeatButtonState(model.getRepeatMode());
         view.setShuffleButtonState(model.isRandomMode());
         updatePlaylistDisplay();
-        view.repaint();
+        refreshControlState();
     }
 
     private void updatePlaylistDisplay() {
-        List<String> displayNames = new ArrayList<>();
-        for (int i = 0; i < model.getSongCount(); i++) {
-            Song song = model.getSong(i);
-            String name = song.getName();
-            if (model.getCurrentSong() != null && model.getCurrentSong().equals(song)) {
-                name = Strings.CURRENT_MARKER + name;
-            }
-            displayNames.add(name);
+        List<PlaylistItem> items = new ArrayList<>();
+        for (Song song : model.getSongs()) {
+            items.add(new PlaylistItem(displayTitle(song), song.getAbsolutePath()));
         }
-        view.refreshPlaylist(displayNames);
+        view.refreshPlaylist(items, model.getCurrentIndex());
+    }
+
+    private void refreshControlState() {
+        view.updateControlState(model.getSongCount() > 0,
+                view.getSelectedIndices().length > 0,
+                model.getCurrentSong() != null);
+    }
+
+    /** File name without the extension, e.g. "Song.mp3" -> "Song". */
+    private static String displayTitle(Song song) {
+        String name = song.getName();
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    // -------------------------------------------------------------------------
+    // Session
+    // -------------------------------------------------------------------------
+
+    private void restoreSession() {
+        Session session = sessionStore.load();
+        for (Path path : session.songs()) {
+            try {
+                model.addSong(new Song(path.toString()));
+            } catch (PlayerException ignored) {
+                // duplicate entry in the saved file
+            }
+        }
+        view.setVolumeValue(session.volume());
+        model.setRepeatMode(session.repeatMode());
+
+        int index = session.currentIndex();
+        if (index >= 0 && index < model.getSongCount()) {
+            try {
+                model.load(model.getSong(index));
+                view.setSelectedIndex(index);
+            } catch (BasicPlayerException ex) {
+                Utils.log(PlayerController.class.getName(), ex);
+                model.setCurrentSong(null);
+            }
+        }
+        model.setRandomMode(session.shuffle());
+    }
+
+    private void saveSession() {
+        List<Path> songs = model.getSongs().stream().map(File::toPath).toList();
+        try {
+            sessionStore.save(new Session(songs, model.getCurrentIndex(), view.getVolumeValue(),
+                    model.getRepeatMode(), model.isRandomMode()));
+        } catch (IOException ex) {
+            Utils.log(PlayerController.class.getName(), ex);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Adding songs
+    // -------------------------------------------------------------------------
+
+    private void openSongDialog() {
+        File[] files = view.showOpenDialog();
+        if (files != null && files.length > 0) {
+            addFiles(Arrays.asList(files));
+        }
+    }
+
+    private void openFolderDialog() {
+        File dir = view.showOpenFolderDialog();
+        if (dir != null) {
+            addFiles(List.of(dir));
+        }
+    }
+
+    /**
+     * Adds files and (recursively) the MP3s inside folders. Duplicates are skipped.
+     * If nothing was loaded yet, the first added song starts playing.
+     */
+    private void addFiles(List<File> files) {
+        List<File> mp3s = expandToMp3s(files);
+        if (mp3s.isEmpty()) {
+            view.showInfo(Strings.NO_MP3_FOUND);
+            return;
+        }
+
+        int duplicates = 0;
+        int firstAdded = -1;
+        for (File f : mp3s) {
+            try {
+                model.addSong(new Song(f.getAbsolutePath()));
+                if (firstAdded < 0) {
+                    firstAdded = model.getSongCount() - 1;
+                }
+            } catch (PlayerException ex) {
+                duplicates++;
+            }
+        }
+
+        if (firstAdded < 0) {
+            view.showInfo(String.format(Strings.SKIPPED_DUPLICATES, duplicates));
+            return;
+        }
+        if (model.getCurrentSong() == null) {
+            Song first = model.getSong(firstAdded);
+            try {
+                model.setCurrentSong(first);
+                model.open(first);
+            } catch (BasicPlayerException ex) {
+                Utils.log(PlayerException.ERROR_OPENING_SONG, ex);
+                model.setCurrentSong(null);
+                update();
+                view.showError(PlayerException.ERROR, String.format(Strings.FAILED_TO_OPEN, 1));
+            }
+        }
+        view.setSelectedIndex(firstAdded);
+    }
+
+    private static List<File> expandToMp3s(List<File> files) {
+        List<File> result = new ArrayList<>();
+        for (File f : files) {
+            if (f.isDirectory()) {
+                try (Stream<Path> walk = Files.walk(f.toPath(), MAX_FOLDER_DEPTH)) {
+                    walk.filter(Files::isRegularFile)
+                        .map(Path::toFile)
+                        .filter(PlayerController::isMp3)
+                        .sorted()
+                        .forEach(result::add);
+                } catch (IOException | RuntimeException ex) {
+                    Utils.log(PlayerController.class.getName(), new IOException(ex));
+                }
+            } else if (isMp3(f)) {
+                result.add(f);
+            }
+        }
+        return result;
+    }
+
+    private static boolean isMp3(File f) {
+        return f.getName().toLowerCase(Locale.ROOT).endsWith(".mp3");
     }
 
     // -------------------------------------------------------------------------
     // Playback actions
     // -------------------------------------------------------------------------
 
-    private void openSongDialog() {
-        File[] files = view.showOpenDialog();
-        if (files == null || files.length == 0) {
+    private void togglePlayPause() {
+        if (model.getCurrentSong() == null) {
+            if (model.getSongCount() == 0) {
+                openSongDialog();
+            } else {
+                int selected = view.getSelectedIndex();
+                playSongAt(selected >= 0 ? selected : 0);
+            }
+        } else if (model.isPlaying()) {
+            pauseSong();
+        } else if (model.isPaused()) {
+            resumeSong();
+        } else {
+            playSong();
+        }
+    }
+
+    private void playSelected() {
+        int selected = view.getSelectedIndex();
+        if (selected >= 0) {
+            playSongAt(selected);
+        }
+    }
+
+    /** Plays the song at {@code index} from the start (also restarts the current one). */
+    private void playSongAt(int index) {
+        if (index < 0 || index >= model.getSongCount()) {
             return;
         }
-        for (File f : files) {
-            if (f.getAbsolutePath().endsWith(".mp3")) {
-                try {
-                    Song song = new Song(f.getAbsolutePath());
-                    model.addSong(song);
-                    if (model.getCurrentSong() == null) {
-                        model.setCurrentSong(song);
-                        model.open(model.getCurrentSong());
-                        view.setSelectedIndex(model.getSongCount() - 1);
-                    }
-                } catch (BasicPlayerException | PlayerException ex) {
-                    Utils.log(PlayerException.ERROR_OPENING_SONG, ex);
-                    if (files.length == 1) {
-                        JOptionPane.showMessageDialog(null, PlayerException.ERROR_OPENING_SONG,
-                                PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-                    }
-                }
-            }
+        try {
+            Song song = model.getSong(index);
+            model.setCurrentSong(song);
+            model.stop();
+            model.clearShuffleHistory();
+            model.open(song);
+        } catch (BasicPlayerException ex) {
+            fail(PlayerException.ERROR_OPENING_SONG, ex);
         }
     }
 
@@ -288,9 +430,7 @@ public class PlayerController implements Serializable, ModelObserver {
         try {
             model.play();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_PLAYING_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_PLAYING_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_PLAYING_SONG, ex);
         }
     }
 
@@ -298,9 +438,7 @@ public class PlayerController implements Serializable, ModelObserver {
         try {
             model.pause();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_PAUSING_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_PAUSING_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_PAUSING_SONG, ex);
         }
     }
 
@@ -308,40 +446,62 @@ public class PlayerController implements Serializable, ModelObserver {
         try {
             model.resume();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_RESUMING_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_RESUMING_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_RESUMING_SONG, ex);
         }
     }
 
     private void stopSong() {
+        if (model.getCurrentSong() == null) {
+            return;
+        }
         try {
             model.stop();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_STOPPING_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_STOPPING_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_STOPPING_SONG, ex);
         }
     }
 
     private void nextSong() {
+        if (model.getCurrentSong() == null) {
+            return;
+        }
         try {
-            model.next(true);
+            model.skipForward();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_NEXT_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_NEXT_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_NEXT_SONG, ex);
         }
     }
 
+    /** Restarts the current song if it has been playing a while, otherwise goes back one. */
     private void previousSong() {
-        try {
-            model.previous(true);
-        } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_PREV_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_PREV_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+        if (model.getCurrentSong() == null) {
+            return;
         }
+        try {
+            if (model.getProgressTime() > RESTART_THRESHOLD_US) {
+                model.replayCurrent();
+            } else {
+                model.previous(true);
+            }
+        } catch (BasicPlayerException ex) {
+            fail(PlayerException.ERROR_PREV_SONG, ex);
+        }
+    }
+
+    private void cycleRepeat() {
+        // none -> all -> one -> none
+        Boolean current = model.getRepeatMode();
+        if (current == null) {
+            model.setRepeatMode(Boolean.TRUE);
+        } else if (current) {
+            model.setRepeatMode(Boolean.FALSE);
+        } else {
+            model.setRepeatMode(null);
+        }
+    }
+
+    private void toggleShuffle() {
+        model.setRandomMode(!model.isRandomMode());
     }
 
     private void setVolume() {
@@ -352,35 +512,84 @@ public class PlayerController implements Serializable, ModelObserver {
         }
     }
 
-    private void clearPlaylist() {
+    // -------------------------------------------------------------------------
+    // Seeking
+    // -------------------------------------------------------------------------
+
+    private void previewSeek(double ratio) {
+        Song current = model.getCurrentSong();
+        if (current == null) {
+            return;
+        }
+        scrubbing = true;
+        view.setProgressValue((int) (ratio * view.getProgressMax()));
+        view.setProgressText(Utils.formatTime((long) (ratio * current.getDuration()))
+                + Strings.OF + Utils.formatTime(current.getDuration()));
+    }
+
+    private void commitSeek(double ratio) {
+        scrubbing = false;
+        Song current = model.getCurrentSong();
+        if (current == null) {
+            return;
+        }
         try {
-            model.clearPlaylist();
+            model.seek((long) (ratio * current.getBytesLength()));
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_CLEAR_LIST, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_CLEAR_LIST,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            Utils.display("Seek error: " + ex.getMessage());
+        }
+        refreshProgress();
+    }
+
+    private void seekBy(long deltaMicros) {
+        Song current = model.getCurrentSong();
+        if (current == null || current.getDuration() <= 0 || current.getBytesLength() <= 0) {
+            return;
+        }
+        double ratio = model.getProgressBytes() / current.getBytesLength()
+                + (double) deltaMicros / current.getDuration();
+        commitSeek(Math.max(0, Math.min(1, ratio)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Playlist editing
+    // -------------------------------------------------------------------------
+
+    private void removeSelected() {
+        int[] indices = view.getSelectedIndices();
+        if (indices.length == 0) {
+            return;
+        }
+        List<Song> songs = new ArrayList<>();
+        for (int i : indices) {
+            songs.add(model.getSong(i));
+        }
+        int first = Arrays.stream(indices).min().getAsInt();
+        try {
+            model.removeSongs(songs);
+        } catch (BasicPlayerException ex) {
+            fail(PlayerException.ERROR_REMOVE_SONG, ex);
+        }
+        int remaining = model.getSongCount();
+        if (remaining > 0) {
+            view.setSelectedIndex(Math.min(first, remaining - 1));
         }
     }
 
-    private void openSong(String name) {
+    private void clearPlaylist() {
+        if (model.getSongCount() == 0 || !view.confirm(Strings.CONFIRM_CLEAR_MSG)) {
+            return;
+        }
         try {
-            Song song = model.getSong(name);
-            model.setCurrentSong(song);
-            model.stop();
-            model.open(song);
+            model.clearPlaylist();
         } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_OPENING_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_OPENING_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
+            fail(PlayerException.ERROR_CLEAR_LIST, ex);
         }
     }
 
     private void moveSelection(int direction) {
-        if (model.getSongCount() == 0) return;
         int[] indices = view.getSelectedIndices();
         if (indices.length == 0) {
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_NO_SONG_SELECTED,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
             return;
         }
         Arrays.sort(indices);
@@ -409,18 +618,8 @@ public class PlayerController implements Serializable, ModelObserver {
         view.setSelectedIndices(result);
     }
 
-    private void removeSong(String name) {
-        try {
-            Song song = model.getSong(name);
-            model.removeSong(song);
-        } catch (BasicPlayerException ex) {
-            Utils.log(PlayerException.ERROR_REMOVE_SONG, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_REMOVE_SONG,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-        } catch (PlayerException ex) {
-            Utils.log(PlayerException.ERROR_REMOVE_SONG_NO_EXISTS, ex);
-            JOptionPane.showMessageDialog(null, PlayerException.ERROR_REMOVE_SONG_NO_EXISTS,
-                    PlayerException.ERROR, JOptionPane.ERROR_MESSAGE);
-        }
+    private void fail(String message, Exception ex) {
+        Utils.log(message, ex);
+        view.showError(PlayerException.ERROR, message);
     }
 }
