@@ -5,12 +5,21 @@ import avuuna.player.utils.Strings;
 
 import javax.swing.*;
 import javax.swing.event.ChangeListener;
+import javax.swing.event.ListSelectionListener;
 import java.awt.*;
+import java.awt.datatransfer.DataFlavor;
 import java.awt.event.ActionListener;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.DoubleConsumer;
 
 /**
  * Main application window. Declares and lays out all UI components.
@@ -19,9 +28,30 @@ import java.util.List;
 public class GUIPlayer extends View {
     private static final long serialVersionUID = 422073346876789713L;
 
-    private JMenu fileMenu;
-    private JMenuBar menuBar;
+    private static final Color ACCENT = new Color(30, 120, 215);
+    private static final Color MUTED_TEXT = new Color(130, 130, 130);
+
+    /** One row of the playlist as shown to the user. */
+    public record PlaylistItem(String title, String tooltip) {}
+
+    /** What to do with the current songs when opening a playlist file. */
+    public enum PlaylistOpenMode { REPLACE, ADD }
+
+    private static final String PS_PRELUDE =
+            // Force UTF-8 output: PowerShell defaults to the OEM codepage, which
+            // garbles non-ASCII paths (e.g. "Canción.mp3") when decoded by Java.
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            + "Add-Type -AssemblyName System.Windows.Forms; ";
+    private static final String PS_PLAYLIST_FILTER =
+            "Playlists (*.m3u8;*.m3u)|*.m3u8;*.m3u|All files (*.*)|*.*";
+
     private JMenuItem openItem;
+    private JMenuItem openFolderItem;
+    private JMenuItem openPlaylistItem;
+    private JMenuItem savePlaylistItem;
+    private JMenuItem exitItem;
+    private JMenuItem shortcutsItem;
+    private JMenuItem aboutItem;
 
     private JPanel playerPanel;
 
@@ -37,12 +67,14 @@ public class GUIPlayer extends View {
 
     private JPanel volumePanel;
     private JSlider volumeSlider;
+    private JLabel volumeLabel;
 
     private JPanel playlistPanel;
 
     private JScrollPane listScroll;
-    private JList<String> songList;
-    private DefaultListModel<String> listModel;
+    private JList<PlaylistItem> songList;
+    private DefaultListModel<PlaylistItem> listModel;
+    private int currentPlaylistIndex = -1;
 
     private JButton addButton;
     private JButton removeButton;
@@ -51,7 +83,7 @@ public class GUIPlayer extends View {
     private JButton moveDownButton;
 
     public GUIPlayer() {
-        super("Music Player - by Avuuna, la Luz del Alba");
+        super(Strings.APP_TITLE);
         buildComponents();
         buildMenuComponents();
     }
@@ -66,6 +98,34 @@ public class GUIPlayer extends View {
 
     public void setOpenMenuAccelerator(KeyStroke ks) {
         openItem.setAccelerator(ks);
+    }
+
+    public void addOpenFolderMenuListener(ActionListener l) {
+        openFolderItem.addActionListener(l);
+    }
+
+    public void setOpenFolderMenuAccelerator(KeyStroke ks) {
+        openFolderItem.setAccelerator(ks);
+    }
+
+    public void addOpenPlaylistMenuListener(ActionListener l) {
+        openPlaylistItem.addActionListener(l);
+    }
+
+    public void setOpenPlaylistMenuAccelerator(KeyStroke ks) {
+        openPlaylistItem.setAccelerator(ks);
+    }
+
+    public void addSavePlaylistMenuListener(ActionListener l) {
+        savePlaylistItem.addActionListener(l);
+    }
+
+    public void setSavePlaylistMenuAccelerator(KeyStroke ks) {
+        savePlaylistItem.setAccelerator(ks);
+    }
+
+    public void addExitMenuListener(ActionListener l) {
+        exitItem.addActionListener(l);
     }
 
     public void addPlayListener(ActionListener l) {
@@ -100,6 +160,10 @@ public class GUIPlayer extends View {
         songList.addMouseListener(l);
     }
 
+    public void addSongListSelectionListener(ListSelectionListener l) {
+        songList.addListSelectionListener(l);
+    }
+
     public void addAddSongListener(ActionListener l) {
         addButton.addActionListener(l);
     }
@@ -120,30 +184,131 @@ public class GUIPlayer extends View {
         moveDownButton.addActionListener(l);
     }
 
+    /**
+     * Registers seeking on the progress bar. While the user presses or drags,
+     * {@code onPreview} receives the position as a ratio in [0, 1]; on release,
+     * {@code onCommit} receives the final ratio.
+     */
+    public void addSeekListener(DoubleConsumer onPreview, DoubleConsumer onCommit) {
+        MouseAdapter seek = new MouseAdapter() {
+            private boolean dragging;
+
+            private double ratio(MouseEvent e) {
+                double r = (double) e.getX() / Math.max(1, progressBar.getWidth());
+                return Math.max(0, Math.min(1, r));
+            }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e) && progressBar.isEnabled()) {
+                    dragging = true;
+                    onPreview.accept(ratio(e));
+                }
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                if (dragging) {
+                    onPreview.accept(ratio(e));
+                }
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (dragging) {
+                    dragging = false;
+                    onCommit.accept(ratio(e));
+                }
+            }
+        };
+        progressBar.addMouseListener(seek);
+        progressBar.addMouseMotionListener(seek);
+    }
+
+    /**
+     * Accepts files and folders dropped anywhere on the window.
+     */
+    public void setFileDropHandler(Consumer<List<File>> handler) {
+        TransferHandler th = new TransferHandler() {
+            @Override
+            public boolean canImport(TransferSupport support) {
+                return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public boolean importData(TransferSupport support) {
+                if (!canImport(support)) {
+                    return false;
+                }
+                try {
+                    List<File> files = (List<File>) support.getTransferable()
+                            .getTransferData(DataFlavor.javaFileListFlavor);
+                    // Let the drop finish before doing slow work / showing dialogs.
+                    SwingUtilities.invokeLater(() -> handler.accept(new ArrayList<>(files)));
+                    return true;
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+        };
+        setTransferHandler(th);
+        songList.setTransferHandler(th);
+        listScroll.setTransferHandler(th);
+    }
+
+    /**
+     * Binds a keyboard shortcut that works anywhere in the window.
+     */
+    public void bindShortcut(KeyStroke ks, String name, Runnable action) {
+        JRootPane root = getRootPane();
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(ks, name);
+        root.getActionMap().put(name, new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                action.run();
+            }
+        });
+    }
+
     // -------------------------------------------------------------------------
     // State update methods
     // -------------------------------------------------------------------------
 
     public void setPlayingState(boolean playing) {
         if (playing) {
-            playButton.setToolTipText(Strings.PAUSE);
+            setButtonTip(playButton, Strings.PAUSE);
             playButton.setIcon(Images.getImageIcon(Images.BTN_PAUSE));
         } else {
-            playButton.setToolTipText(Strings.PLAY);
+            setButtonTip(playButton, Strings.PLAY);
             playButton.setIcon(Images.getImageIcon(Images.BTN_PLAY));
         }
     }
 
-    public boolean isShowingPause() {
-        return Strings.PAUSE.equals(playButton.getToolTipText());
-    }
-
+    /**
+     * Shows the current song title, or a hint when nothing is loaded.
+     * Also reflects it in the window title so it is visible in the taskbar.
+     */
     public void setSongLabel(String name) {
-        currentSongLabel.setText(name != null ? Strings.CURRENT_SONG_LABEL + name : Strings.CURRENT_SONG_LABEL);
+        if (name != null) {
+            currentSongLabel.setText(name);
+            currentSongLabel.setForeground(UIManager.getColor("Label.foreground"));
+            currentSongLabel.setToolTipText(name);
+            setTitle(name + " — " + Strings.APP_TITLE);
+        } else {
+            currentSongLabel.setText(Strings.NO_SONG_LOADED);
+            currentSongLabel.setForeground(MUTED_TEXT);
+            currentSongLabel.setToolTipText(null);
+            setTitle(Strings.APP_TITLE);
+        }
     }
 
     public void setProgressMax(int max) {
         progressBar.setMaximum(max);
+    }
+
+    public int getProgressMax() {
+        return progressBar.getMaximum();
     }
 
     public void setProgressValue(int value) {
@@ -154,42 +319,66 @@ public class GUIPlayer extends View {
         progressBar.setString(text);
     }
 
-    public void addProgressClickListener(MouseListener l) {
-        progressBar.addMouseListener(l);
-    }
-
-    public void refreshPlaylist(List<String> items) {
+    /**
+     * Replaces the playlist rows. When only the current-song marker changed, the
+     * rows are kept and just repainted, so the user's selection and scroll stay put.
+     */
+    public void refreshPlaylist(List<PlaylistItem> items, int currentIndex) {
+        boolean sameRows = items.size() == listModel.size();
+        for (int i = 0; sameRows && i < items.size(); i++) {
+            sameRows = items.get(i).equals(listModel.get(i));
+        }
+        currentPlaylistIndex = currentIndex;
+        if (sameRows) {
+            songList.repaint();
+            return;
+        }
+        int[] selected = songList.getSelectedIndices();
         listModel.clear();
-        for (String item : items) {
+        for (PlaylistItem item : items) {
             listModel.addElement(item);
         }
-    }
-
-    public boolean isPlaylistEmpty() {
-        return listModel.isEmpty();
+        int[] stillValid = Arrays.stream(selected).filter(i -> i < items.size()).toArray();
+        songList.setSelectedIndices(stillValid);
     }
 
     public void setRepeatButtonState(Boolean repeatMode) {
         if (repeatMode == null) {
-            repeatButton.setToolTipText(Strings.NO_REPEAT);
+            setButtonTip(repeatButton, Strings.NO_REPEAT);
             repeatButton.setIcon(Images.getImageIcon(Images.BTN_REPEAT_NONE));
         } else if (repeatMode) {
-            repeatButton.setToolTipText(Strings.REPEAT_ALL);
+            setButtonTip(repeatButton, Strings.REPEAT_ALL);
             repeatButton.setIcon(Images.getImageIcon(Images.BTN_REPEAT_ALL));
         } else {
-            repeatButton.setToolTipText(Strings.REPEAT_ONE);
+            setButtonTip(repeatButton, Strings.REPEAT_ONE);
             repeatButton.setIcon(Images.getImageIcon(Images.BTN_REPEAT_ONE));
         }
     }
 
     public void setShuffleButtonState(boolean shuffle) {
         if (shuffle) {
-            shuffleButton.setToolTipText(Strings.SHUFFLE_ON);
+            setButtonTip(shuffleButton, Strings.SHUFFLE_ON);
             shuffleButton.setIcon(Images.getImageIcon(Images.BTN_SHUFFLE_ON));
         } else {
-            shuffleButton.setToolTipText(Strings.SHUFFLE_OFF);
+            setButtonTip(shuffleButton, Strings.SHUFFLE_OFF);
             shuffleButton.setIcon(Images.getImageIcon(Images.BTN_SHUFFLE_OFF));
         }
+    }
+
+    /**
+     * Enables only the controls that can do something in the current state,
+     * instead of showing error dialogs after the fact.
+     */
+    public void updateControlState(boolean hasSongs, boolean hasSelection, boolean hasCurrent) {
+        stopButton.setEnabled(hasCurrent);
+        prevButton.setEnabled(hasCurrent);
+        nextButton.setEnabled(hasCurrent);
+        progressBar.setEnabled(hasCurrent);
+        removeButton.setEnabled(hasSelection);
+        moveUpButton.setEnabled(hasSelection);
+        moveDownButton.setEnabled(hasSelection);
+        clearButton.setEnabled(hasSongs);
+        savePlaylistItem.setEnabled(hasSongs);
     }
 
     // -------------------------------------------------------------------------
@@ -200,58 +389,178 @@ public class GUIPlayer extends View {
         return songList.getSelectedIndex();
     }
 
-    public String getSelectedValue() {
-        return songList.getSelectedValue();
-    }
-
     public void setSelectedIndex(int index) {
         songList.setSelectedIndex(index);
+        songList.ensureIndexIsVisible(index);
     }
 
     public int[] getSelectedIndices() {
         return songList.getSelectedIndices();
     }
 
-    public List<String> getSelectedValues() {
-        return songList.getSelectedValuesList();
-    }
-
     public void setSelectedIndices(int[] indices) {
         songList.setSelectedIndices(indices);
+        if (indices.length > 0) {
+            songList.ensureIndexIsVisible(indices[0]);
+        }
+    }
+
+    /** Returns the playlist row under the mouse, or -1 if the click was below the last row. */
+    public int getPlaylistIndexAt(Point p) {
+        int index = songList.locationToIndex(p);
+        if (index >= 0 && songList.getCellBounds(index, index).contains(p)) {
+            return index;
+        }
+        return -1;
     }
 
     public int getVolumeValue() {
         return volumeSlider.getValue();
     }
 
+    public void setVolumeValue(int value) {
+        volumeSlider.setValue(value);
+    }
+
+    // -------------------------------------------------------------------------
+    // Dialogs
+    // -------------------------------------------------------------------------
+
+    public boolean confirm(String message) {
+        return JOptionPane.showConfirmDialog(this, message, Strings.CONFIRM_TITLE,
+                JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE) == JOptionPane.YES_OPTION;
+    }
+
+    public void showInfo(String message) {
+        JOptionPane.showMessageDialog(this, message, Strings.PLAYLIST_TITLE, JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    public void showError(String title, String message) {
+        JOptionPane.showMessageDialog(this, message, title, JOptionPane.ERROR_MESSAGE);
+    }
+
+    public void addShortcutsMenuListener(ActionListener l) {
+        shortcutsItem.addActionListener(l);
+    }
+
+    public void addAboutMenuListener(ActionListener l) {
+        aboutItem.addActionListener(l);
+    }
+
+    public void showShortcutsDialog() {
+        JOptionPane.showMessageDialog(this, Strings.SHORTCUTS_TEXT, Strings.SHORTCUTS_ITEM,
+                JOptionPane.PLAIN_MESSAGE);
+    }
+
+    public void showAboutDialog() {
+        JOptionPane.showMessageDialog(this, Strings.ABOUT_TEXT, Strings.ABOUT_ITEM,
+                JOptionPane.INFORMATION_MESSAGE, Images.getImageIcon(Images.IMG_LOGO));
+    }
+
+    public File showOpenFolderDialog() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle(Strings.OPEN_FOLDER_ITEM);
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        return chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION ? chooser.getSelectedFile() : null;
+    }
+
+    /**
+     * Asks whether an opened playlist replaces the current songs or is appended.
+     * Returns {@code null} if the user cancels.
+     */
+    public PlaylistOpenMode askReplaceOrAdd(String playlistName) {
+        Object[] options = {Strings.REPLACE_OPTION, Strings.ADD_OPTION, Strings.CANCEL_OPTION};
+        int choice = JOptionPane.showOptionDialog(this,
+                String.format(Strings.REPLACE_OR_ADD_MSG, playlistName), Strings.REPLACE_OR_ADD_TITLE,
+                JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+        if (choice == 0) return PlaylistOpenMode.REPLACE;
+        if (choice == 1) return PlaylistOpenMode.ADD;
+        return null;
+    }
+
+    /** Native Windows picker for MP3 files (multi-select). Returns {@code null} if cancelled. */
     public File[] showOpenDialog() {
         try {
-            String script =
-                "Add-Type -AssemblyName System.Windows.Forms; " +
+            String output = runPowerShellDialog(
                 "$d = New-Object System.Windows.Forms.OpenFileDialog; " +
                 "$d.Filter = 'MP3 Files (*.mp3)|*.mp3'; " +
                 "$d.Multiselect = $true; " +
-                "$d.Title = 'Open'; " +
-                "if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join [System.Environment]::NewLine }";
-
-            Process process = new ProcessBuilder("powershell", "-NoProfile", "-STA", "-Command", script)
-                .start();
-
-            String output = new String(process.getInputStream().readAllBytes()).trim();
-            int exitCode = process.waitFor();
-
-            if (exitCode != 0) {
-                return showLegacyOpenDialog();
+                "$d.Title = '" + Strings.ADD_SONGS_DIALOG_TITLE + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join [System.Environment]::NewLine }");
+            if (output.isEmpty()) {
+                return null; // user cancelled
             }
-            if (!output.isEmpty()) {
-                return Arrays.stream(output.split("\\r?\\n"))
-                    .map(File::new)
-                    .toArray(File[]::new);
-            }
-            return null; // user cancelled
+            return Arrays.stream(output.split("\\r?\\n")).map(File::new).toArray(File[]::new);
         } catch (Exception ignored) {
             return showLegacyOpenDialog();
         }
+    }
+
+    /** Native Windows picker for one .m3u8/.m3u file. Returns {@code null} if cancelled. */
+    public File showOpenPlaylistDialog() {
+        try {
+            String output = runPowerShellDialog(
+                "$d = New-Object System.Windows.Forms.OpenFileDialog; " +
+                "$d.Filter = '" + PS_PLAYLIST_FILTER + "'; " +
+                "$d.Title = '" + Strings.OPEN_PLAYLIST_ITEM.replace("...", "") + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileName }");
+            return output.isEmpty() ? null : new File(output);
+        } catch (Exception ignored) {
+            JFileChooser chooser = playlistChooser(Strings.OPEN_PLAYLIST_ITEM);
+            return chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION ? chooser.getSelectedFile() : null;
+        }
+    }
+
+    /**
+     * Native Windows "Save as" for a playlist (asks before overwriting). Returns {@code null}
+     * if cancelled. The extension may be missing when the fallback chooser is used.
+     */
+    public File showSavePlaylistDialog() {
+        try {
+            String output = runPowerShellDialog(
+                "$d = New-Object System.Windows.Forms.SaveFileDialog; " +
+                "$d.Filter = 'M3U8 playlist (*.m3u8)|*.m3u8|M3U playlist (*.m3u)|*.m3u'; " +
+                "$d.DefaultExt = 'm3u8'; $d.AddExtension = $true; $d.OverwritePrompt = $true; " +
+                "$d.FileName = '" + Strings.DEFAULT_PLAYLIST_NAME + "'; " +
+                "$d.Title = '" + Strings.SAVE_PLAYLIST_ITEM.replace("...", "") + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileName }");
+            return output.isEmpty() ? null : new File(output);
+        } catch (Exception ignored) {
+            JFileChooser chooser = playlistChooser(Strings.SAVE_PLAYLIST_ITEM);
+            chooser.setSelectedFile(new File(Strings.DEFAULT_PLAYLIST_NAME + ".m3u8"));
+            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+                return null;
+            }
+            File file = chooser.getSelectedFile();
+            if (file.exists() && !confirm(String.format(Strings.CONFIRM_OVERWRITE_MSG, file.getName()))) {
+                return null;
+            }
+            return file;
+        }
+    }
+
+    private static JFileChooser playlistChooser(String title) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle(title);
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                Strings.PLAYLIST_FILES_FILTER, "m3u8", "m3u"));
+        return chooser;
+    }
+
+    /**
+     * Runs a Windows Forms dialog script in PowerShell and returns what it printed
+     * (empty when the user cancelled). Throws if PowerShell is unavailable or fails,
+     * so callers can fall back to a Swing/AWT dialog.
+     */
+    private static String runPowerShellDialog(String script) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder("powershell", "-NoProfile", "-STA", "-Command", PS_PRELUDE + script)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        if (process.waitFor() != 0) {
+            throw new IOException("PowerShell dialog failed");
+        }
+        return output;
     }
 
     private File[] showLegacyOpenDialog() {
@@ -267,18 +576,46 @@ public class GUIPlayer extends View {
     // UI construction
     // -------------------------------------------------------------------------
 
+    private static void setButtonTip(JButton button, String tip) {
+        button.setToolTipText(tip);
+        button.getAccessibleContext().setAccessibleName(tip);
+    }
+
+    private static JButton iconButton(String iconKey, String tip) {
+        JButton button = new JButton(Images.getImageIcon(iconKey));
+        setButtonTip(button, tip);
+        return button;
+    }
+
     private void buildMenuComponents() {
-        menuBar = new JMenuBar();
+        JMenuBar menuBar = new JMenuBar();
         setJMenuBar(menuBar);
 
-        fileMenu = new JMenu();
-        fileMenu.setText(Strings.FILE_MENU);
+        JMenu fileMenu = new JMenu(Strings.FILE_MENU);
+        fileMenu.setMnemonic('F');
         menuBar.add(fileMenu);
 
-        openItem = new JMenuItem();
-        openItem.setText(Strings.OPEN_ITEM);
-        openItem.setIcon(Images.getImageIcon(Images.IMG_OPEN));
+        openItem = new JMenuItem(Strings.OPEN_ITEM, Images.getImageIcon(Images.IMG_OPEN));
         fileMenu.add(openItem);
+        openFolderItem = new JMenuItem(Strings.OPEN_FOLDER_ITEM);
+        fileMenu.add(openFolderItem);
+        fileMenu.addSeparator();
+        openPlaylistItem = new JMenuItem(Strings.OPEN_PLAYLIST_ITEM);
+        fileMenu.add(openPlaylistItem);
+        savePlaylistItem = new JMenuItem(Strings.SAVE_PLAYLIST_ITEM);
+        fileMenu.add(savePlaylistItem);
+        fileMenu.addSeparator();
+        exitItem = new JMenuItem(Strings.EXIT_ITEM);
+        fileMenu.add(exitItem);
+
+        JMenu helpMenu = new JMenu(Strings.HELP_MENU);
+        helpMenu.setMnemonic('H');
+        menuBar.add(helpMenu);
+        shortcutsItem = new JMenuItem(Strings.SHORTCUTS_ITEM);
+        shortcutsItem.setAccelerator(KeyStroke.getKeyStroke("F1"));
+        helpMenu.add(shortcutsItem);
+        aboutItem = new JMenuItem(Strings.ABOUT_ITEM);
+        helpMenu.add(aboutItem);
     }
 
     private void buildComponents() {
@@ -293,54 +630,40 @@ public class GUIPlayer extends View {
         layoutPlaylistPanel();
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, playerPanel, playlistPanel);
-        splitPane.setEnabled(false);
+        splitPane.setContinuousLayout(true);
+        splitPane.setResizeWeight(0.4); // extra width goes mostly to the playlist
+        splitPane.setBorder(BorderFactory.createEmptyBorder());
         this.add(splitPane, BorderLayout.CENTER);
     }
 
     private void buildPlayerComponents() {
         currentSongLabel = new JLabel();
-        currentSongLabel.setText(Strings.CURRENT_SONG_LABEL);
         currentSongLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        currentSongLabel.setFont(currentSongLabel.getFont().deriveFont(Font.BOLD, 14f));
+        setSongLabel(null);
 
         progressBar = new JProgressBar();
         progressBar.setMinimum(0);
         progressBar.setMaximum(0);
         progressBar.setStringPainted(true);
         progressBar.setString(Strings.ZERO_TIME);
+        progressBar.setToolTipText(Strings.SEEK_TOOLTIP);
         progressBar.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
-        prevButton = new JButton();
-        prevButton.setToolTipText(Strings.PREV);
-        prevButton.setIcon(Images.getImageIcon(Images.BTN_PREV));
-        prevButton.setFocusable(false);
+        prevButton = iconButton(Images.BTN_PREV, Strings.PREV);
+        playButton = iconButton(Images.BTN_PLAY, Strings.PLAY);
+        stopButton = iconButton(Images.BTN_STOP, Strings.STOP);
+        nextButton = iconButton(Images.BTN_NEXT, Strings.NEXT);
+        repeatButton = iconButton(Images.BTN_REPEAT_NONE, Strings.NO_REPEAT);
+        shuffleButton = iconButton(Images.BTN_SHUFFLE_OFF, Strings.SHUFFLE_OFF);
 
-        playButton = new JButton();
-        playButton.setToolTipText(Strings.PLAY);
-        playButton.setIcon(Images.getImageIcon(Images.BTN_PLAY));
-        playButton.setFocusable(false);
-
-        stopButton = new JButton();
-        stopButton.setToolTipText(Strings.STOP);
-        stopButton.setIcon(Images.getImageIcon(Images.BTN_STOP));
-        stopButton.setFocusable(false);
-
-        nextButton = new JButton();
-        nextButton.setToolTipText(Strings.NEXT);
-        nextButton.setIcon(Images.getImageIcon(Images.BTN_NEXT));
-        nextButton.setFocusable(false);
-
-        repeatButton = new JButton();
-        repeatButton.setToolTipText(Strings.NO_REPEAT);
-        repeatButton.setIcon(Images.getImageIcon(Images.BTN_REPEAT_NONE));
-        repeatButton.setFocusable(false);
-
-        shuffleButton = new JButton();
-        shuffleButton.setToolTipText(Strings.SHUFFLE_OFF);
-        shuffleButton.setIcon(Images.getImageIcon(Images.BTN_SHUFFLE_OFF));
-        shuffleButton.setFocusable(false);
-
-        volumeSlider = new JSlider();
-        volumeSlider.setFocusable(false);
+        volumeSlider = new JSlider(0, 100, 50);
+        volumeSlider.setToolTipText(Strings.VOLUME_TOOLTIP);
+        volumeSlider.getAccessibleContext().setAccessibleName(Strings.VOLUME_PANEL_TITLE);
+        volumeLabel = new JLabel("50%", SwingConstants.RIGHT);
+        volumeSlider.addChangeListener(e -> volumeLabel.setText(volumeSlider.getValue() + "%"));
+        volumeSlider.addMouseWheelListener(e ->
+                volumeSlider.setValue(volumeSlider.getValue() - e.getWheelRotation() * 5));
     }
 
     private void layoutPlayerPanel() {
@@ -355,7 +678,8 @@ public class GUIPlayer extends View {
         dl.setHorizontalGroup(dl.createParallelGroup(GroupLayout.Alignment.LEADING)
                 .addGroup(dl.createSequentialGroup()
                         .addContainerGap()
-                        .addComponent(currentSongLabel, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                        // min/pref 0: a long song name must not widen the panel; JLabel truncates with "..."
+                        .addComponent(currentSongLabel, 0, 0, Short.MAX_VALUE)
                         .addContainerGap())
                 .addGroup(dl.createSequentialGroup()
                         .addContainerGap()
@@ -375,7 +699,7 @@ public class GUIPlayer extends View {
         dl.setVerticalGroup(dl.createSequentialGroup()
                 .addContainerGap(GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
                 .addComponent(currentSongLabel)
-                .addGap(5, 5, 5)
+                .addGap(8, 8, 8)
                 .addComponent(progressBar, GroupLayout.PREFERRED_SIZE, 24, GroupLayout.PREFERRED_SIZE)
                 .addGap(10, 10, 10)
                 .addGroup(dl.createParallelGroup(GroupLayout.Alignment.BASELINE)
@@ -392,15 +716,15 @@ public class GUIPlayer extends View {
 
         GroupLayout vl = new GroupLayout(volumePanel);
         volumePanel.setLayout(vl);
-        vl.setHorizontalGroup(vl.createParallelGroup(GroupLayout.Alignment.LEADING)
-                .addGroup(vl.createSequentialGroup()
-                        .addContainerGap()
-                        .addComponent(volumeSlider, GroupLayout.DEFAULT_SIZE, GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
-                        .addContainerGap()));
-        vl.setVerticalGroup(vl.createSequentialGroup()
-                .addContainerGap(GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+        vl.setHorizontalGroup(vl.createSequentialGroup()
+                .addContainerGap()
+                .addComponent(volumeSlider, 0, GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                .addPreferredGap(LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(volumeLabel, GroupLayout.PREFERRED_SIZE, 40, GroupLayout.PREFERRED_SIZE)
+                .addContainerGap());
+        vl.setVerticalGroup(vl.createParallelGroup(GroupLayout.Alignment.CENTER)
                 .addComponent(volumeSlider, GroupLayout.PREFERRED_SIZE, GroupLayout.DEFAULT_SIZE, GroupLayout.PREFERRED_SIZE)
-                .addContainerGap(GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE));
+                .addComponent(volumeLabel));
 
         GroupLayout layout = new GroupLayout(playerPanel);
         playerPanel.setLayout(layout);
@@ -416,42 +740,52 @@ public class GUIPlayer extends View {
     private void buildPlaylistComponents() {
         listModel = new DefaultListModel<>();
 
-        songList = new JList<>();
-        songList.setModel(listModel);
+        songList = new JList<>(listModel) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                if (listModel.isEmpty()) {
+                    paintEmptyHint((Graphics2D) g);
+                }
+            }
+
+            private void paintEmptyHint(Graphics2D g) {
+                g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g.setColor(MUTED_TEXT);
+                FontMetrics fm = g.getFontMetrics();
+                int lineHeight = fm.getHeight();
+                Rectangle view = getVisibleRect();
+                int y = view.y + (view.height - 2 * lineHeight) / 2 + fm.getAscent();
+                for (String line : new String[]{Strings.EMPTY_PLAYLIST_LINE1, Strings.EMPTY_PLAYLIST_LINE2}) {
+                    g.drawString(line, view.x + (view.width - fm.stringWidth(line)) / 2, y);
+                    y += lineHeight;
+                }
+            }
+        };
         songList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        songList.setCellRenderer(new PlaylistRenderer());
+        songList.getAccessibleContext().setAccessibleName(Strings.PLAYLIST_TITLE);
+        ToolTipManager.sharedInstance().registerComponent(songList);
 
-        listScroll = new JScrollPane();
-        listScroll.setViewportView(songList);
+        // Let window-level shortcuts reach the controller even when the list has focus.
+        InputMap listKeys = songList.getInputMap(JComponent.WHEN_FOCUSED);
+        for (String key : new String[]{"SPACE", "ctrl UP", "ctrl DOWN", "ctrl LEFT", "ctrl RIGHT",
+                "shift LEFT", "shift RIGHT", "ENTER", "DELETE"}) {
+            listKeys.put(KeyStroke.getKeyStroke(key), "none");
+        }
 
-        addButton = new JButton();
-        addButton.setToolTipText(Strings.ADD_SONG_TOOLTIP);
-        addButton.setIcon(Images.getImageIcon(Images.BTN_PLUS));
-        addButton.setFocusable(false);
+        listScroll = new JScrollPane(songList);
 
-        removeButton = new JButton();
-        removeButton.setToolTipText(Strings.REMOVE_SONG_TOOLTIP);
-        removeButton.setIcon(Images.getImageIcon(Images.BTN_LESS));
-        removeButton.setFocusable(false);
-
-        clearButton = new JButton();
-        clearButton.setToolTipText(Strings.CLEAR_PLAYLIST_TOOLTIP);
-        clearButton.setIcon(Images.getImageIcon(Images.BTN_CLOSE));
-        clearButton.setFocusable(false);
-
-        moveUpButton = new JButton();
-        moveUpButton.setToolTipText(Strings.MOVE_UP_TOOLTIP);
-        moveUpButton.setIcon(Images.getImageIcon(Images.BTN_MOVE_UP));
-        moveUpButton.setFocusable(false);
-
-        moveDownButton = new JButton();
-        moveDownButton.setToolTipText(Strings.MOVE_DOWN_TOOLTIP);
-        moveDownButton.setIcon(Images.getImageIcon(Images.BTN_MOVE_DOWN));
-        moveDownButton.setFocusable(false);
+        addButton = iconButton(Images.BTN_PLUS, Strings.ADD_SONG_TOOLTIP);
+        removeButton = iconButton(Images.BTN_LESS, Strings.REMOVE_SONG_TOOLTIP);
+        clearButton = iconButton(Images.BTN_CLOSE, Strings.CLEAR_PLAYLIST_TOOLTIP);
+        moveUpButton = iconButton(Images.BTN_MOVE_UP, Strings.MOVE_UP_TOOLTIP);
+        moveDownButton = iconButton(Images.BTN_MOVE_DOWN, Strings.MOVE_DOWN_TOOLTIP);
     }
 
     private void layoutPlaylistPanel() {
         playlistPanel.setBorder(BorderFactory.createTitledBorder(Strings.PLAYLIST_TITLE));
-        playlistPanel.setMinimumSize(new Dimension(100, 100));
+        playlistPanel.setMinimumSize(new Dimension(200, 100));
 
         GroupLayout layout = new GroupLayout(playlistPanel);
         playlistPanel.setLayout(layout);
@@ -479,7 +813,30 @@ public class GUIPlayer extends View {
                         .addComponent(moveUpButton)
                         .addComponent(moveDownButton))
                 .addContainerGap());
+    }
 
-        playlistPanel.getAccessibleContext().setAccessibleParent(playlistPanel);
+    /**
+     * Renders "N. Title" rows; the current song is bold, accented and marked with a play glyph.
+     */
+    private class PlaylistRenderer extends DefaultListCellRenderer {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                      boolean isSelected, boolean cellHasFocus) {
+            PlaylistItem item = (PlaylistItem) value;
+            boolean current = index == currentPlaylistIndex;
+            String text = (current ? "▶  " : "") + (index + 1) + ".  " + item.title();
+            super.getListCellRendererComponent(list, text, index, isSelected, cellHasFocus);
+            setToolTipText(item.tooltip());
+            setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+            if (current) {
+                setFont(getFont().deriveFont(Font.BOLD));
+                if (!isSelected) {
+                    setForeground(ACCENT);
+                }
+            }
+            return this;
+        }
     }
 }

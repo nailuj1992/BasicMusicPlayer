@@ -16,7 +16,8 @@ public class MainPlayer {
             JOptionPane.showMessageDialog(null, "Application is already running.");
             System.exit(0);
         }
-        launch();
+        // Swing components must be created and used on the Event Dispatch Thread.
+        SwingUtilities.invokeLater(MainPlayer::launch);
     }
 
     private static void launch() {

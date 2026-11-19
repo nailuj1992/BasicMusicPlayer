@@ -17,6 +17,7 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 
 /**
  * Core playback model. Manages the playlist, player state, and repeat/shuffle logic.<br>
@@ -31,9 +32,21 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
 
     private final List<ModelObserver> observers;
 
+    /** Max time to wait for the finished playback thread to release its stream at end of song. */
+    private static final long PLAYBACK_THREAD_JOIN_MS = 2000;
+
     private int currentEvent;
-    private long progressTime;
-    private double progressBytes;
+    // Written by the audio thread, read by the UI refresh timer.
+    private volatile long progressTime;
+    private volatile double progressBytes;
+
+    /**
+     * Where audio-library callbacks that change model state are executed.
+     * Defaults to the calling thread; the controller sets it to the Swing EDT.
+     */
+    private Executor eventExecutor = Runnable::run;
+
+    private boolean autoPlayOnOpen = true;
     private final BasicPlayer player;
     private Song currentSong;
     private List<Song> playlist;
@@ -72,6 +85,10 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
     // -------------------------------------------------------------------------
     // Repeat / shuffle mode
     // -------------------------------------------------------------------------
+
+    public void setEventExecutor(Executor eventExecutor) {
+        this.eventExecutor = eventExecutor;
+    }
 
     public Boolean getRepeatMode() {
         return repeatMode;
@@ -132,6 +149,11 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
 
     public void seek(long bytes) throws BasicPlayerException {
         player.seek(bytes);
+        // Reflect the new position right away (the audio thread only reports it while playing).
+        if (currentSong != null && currentSong.getBytesLength() > 0) {
+            setProgressBytes(bytes);
+            setProgressTime((long) (currentSong.getDuration() * (bytes / currentSong.getBytesLength())));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -147,21 +169,62 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
     }
 
     public void removeSong(Song song) throws PlayerException, BasicPlayerException {
-        int index = playlist.indexOf(song);
-        boolean removed = playlist.remove(song);
-        if (!removed) {
+        if (!playlist.contains(song)) {
             throw new PlayerException(PlayerException.ERROR_REMOVE_SONG_NO_EXISTS);
         }
-        if (currentSong == song) {
-            if (!playlist.isEmpty()) {
-                shuffleHistory.remove(currentSong);
-                nextFrom(--index, false);
-            } else {
-                stop();
+        removeSongs(List.of(song));
+    }
+
+    /**
+     * Removes several songs in one step. If the current song is among them, the next
+     * surviving song becomes current: it keeps playing if playback was active, otherwise
+     * it is only loaded. Observers are notified once at the end.
+     */
+    public void removeSongs(List<Song> toRemove) throws BasicPlayerException {
+        if (toRemove.isEmpty()) {
+            return;
+        }
+        boolean removingCurrent = currentSong != null && toRemove.contains(currentSong);
+        Song replacement = null;
+        if (removingCurrent) {
+            int oldIndex = playlist.indexOf(currentSong);
+            for (int i = 1; i <= playlist.size() && replacement == null; i++) {
+                Song candidate = playlist.get((oldIndex + i) % playlist.size());
+                if (!toRemove.contains(candidate)) {
+                    replacement = candidate;
+                }
+            }
+        }
+        boolean wasPlaying = isPlaying();
+
+        playlist.removeAll(toRemove);
+        shuffleHistory.removeAll(toRemove);
+
+        if (removingCurrent) {
+            stop();
+            if (replacement == null) {
                 setCurrentSong(null);
+            } else if (wasPlaying) {
+                currentSong = replacement;
+                open(replacement);
+            } else {
+                load(replacement);
             }
         }
         notifyObservers();
+    }
+
+    public int getCurrentIndex() {
+        return currentSong == null ? -1 : playlist.indexOf(currentSong);
+    }
+
+    public boolean isPlaying() {
+        return currentSong != null
+                && (currentEvent == BasicPlayerEvent.PLAYING || currentEvent == BasicPlayerEvent.RESUMED);
+    }
+
+    public boolean isPaused() {
+        return currentSong != null && currentEvent == BasicPlayerEvent.PAUSED;
     }
 
     public boolean isSongInList(Song song) {
@@ -194,13 +257,8 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
         return playlist.get(pos);
     }
 
-    public Song getSong(String name) {
-        for (Song song : playlist) {
-            if (name.equals(song.getName())) {
-                return song;
-            }
-        }
-        return null;
+    public List<Song> getSongs() {
+        return List.copyOf(playlist);
     }
 
     public void swapSongs(int index1, int index2) {
@@ -217,10 +275,32 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
     // Playback controls
     // -------------------------------------------------------------------------
 
+    /**
+     * Opens a song; observers are told it should start playing right away.
+     */
     public void open(Song song) throws BasicPlayerException {
+        autoPlayOnOpen = true;
         player.open(song);
         currentEvent = BasicPlayerEvent.OPENED;
         notifyObservers();
+    }
+
+    /**
+     * Makes {@code song} current and opens it, ready to play, without starting playback.
+     */
+    public void load(Song song) throws BasicPlayerException {
+        currentSong = song;
+        autoPlayOnOpen = false;
+        player.open(song);
+        currentEvent = BasicPlayerEvent.OPENED;
+        notifyObservers();
+    }
+
+    /**
+     * Whether the last {@link #open}/{@link #load} asked for playback to start.
+     */
+    public boolean shouldAutoPlay() {
+        return autoPlayOnOpen;
     }
 
     public void play() throws BasicPlayerException {
@@ -250,6 +330,37 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
         notifyObservers();
     }
 
+    /**
+     * "Next" button: in shuffle mode picks a random song not played yet in this round
+     * (never the current one); otherwise moves to the following song.
+     */
+    public void skipForward() throws BasicPlayerException {
+        if (!randomMode || playlist.size() < 2 || currentSong == null) {
+            next(true);
+            return;
+        }
+        if (!shuffleHistory.contains(currentSong)) {
+            shuffleHistory.add(currentSong);
+        }
+        java.util.Set<Integer> excludes = new java.util.HashSet<>();
+        for (Song played : shuffleHistory) {
+            excludes.add(playlist.indexOf(played));
+        }
+        excludes.remove(-1);
+        if (excludes.size() >= playlist.size()) {
+            // Every song played this round: start a new round, just avoid repeating the current one.
+            shuffleHistory.clear();
+            shuffleHistory.add(currentSong);
+            excludes.clear();
+            excludes.add(playlist.indexOf(currentSong));
+        }
+        int target = Utils.getRandomWithExclusion(0, playlist.size() - 1,
+                excludes.stream().mapToInt(Integer::intValue).toArray());
+        stop();
+        currentSong = playlist.get(target);
+        open(currentSong);
+    }
+
     public void next(boolean clearShuffleHistory) throws BasicPlayerException {
         int index = playlist.indexOf(currentSong);
         nextFrom(index, clearShuffleHistory);
@@ -266,9 +377,19 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
         }
     }
 
+    /**
+     * Moves to the next song (wrapping to the first) and loads it without playing.
+     */
     public void advanceAndStop(boolean clearShuffleHistory) throws BasicPlayerException {
-        next(clearShuffleHistory);
+        if (playlist.isEmpty() || currentSong == null) {
+            return;
+        }
+        int index = playlist.indexOf(currentSong);
         stop();
+        if (clearShuffleHistory) {
+            shuffleHistory.clear();
+        }
+        load(playlist.get((index + 1) % playlist.size()));
     }
 
     public void replayCurrent() throws BasicPlayerException {
@@ -343,53 +464,76 @@ public class MusicPlayer implements BasicPlayerListener, ModelSubject, Serializa
 
     @Override
     public void stateUpdated(BasicPlayerEvent event) {
-        if (event.getCode() == BasicPlayerEvent.EOM) {
+        if (event.getCode() != BasicPlayerEvent.EOM) {
+            return;
+        }
+        // BasicPlayer delivers EOM on a separate launcher thread while the playback
+        // thread is still closing its stream. Wait for it to finish, otherwise opening
+        // the next song races with that cleanup.
+        Thread playbackThread = player.getCurrentThread();
+        if (playbackThread != null && playbackThread != Thread.currentThread()) {
             try {
-                if (repeatMode != null && !repeatMode) {
-                    replayCurrent();
-                } else {
-                    int current = playlist.indexOf(currentSong);
-                    if (randomMode) {
-                        if (shuffleHistory.size() < playlist.size() - 1) {
-                            if (!shuffleHistory.contains(currentSong)) {
-                                shuffleHistory.add(currentSong);
-                            }
-                            int[] excludes = new int[shuffleHistory.size()];
-                            for (int i = 0; i < shuffleHistory.size(); i++) {
-                                excludes[i] = playlist.indexOf(shuffleHistory.get(i));
-                            }
-                            int random = Utils.getRandomWithExclusion(0, playlist.size() - 1, excludes);
+                playbackThread.join(PLAYBACK_THREAD_JOIN_MS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        eventExecutor.execute(this::handleEndOfMedia);
+    }
+
+    void handleEndOfMedia() {
+        if (currentSong == null || playlist.isEmpty()) {
+            return;
+        }
+        try {
+            if (repeatMode != null && !repeatMode) {
+                replayCurrent();
+            } else {
+                int current = playlist.indexOf(currentSong);
+                // Shuffle needs at least two songs; with one, fall through to the
+                // sequential logic (previously this looped forever looking for a
+                // random index that was not excluded).
+                if (randomMode && playlist.size() > 1) {
+                    if (shuffleHistory.size() < playlist.size() - 1) {
+                        if (!shuffleHistory.contains(currentSong)) {
+                            shuffleHistory.add(currentSong);
+                        }
+                        int[] excludes = new int[shuffleHistory.size()];
+                        for (int i = 0; i < shuffleHistory.size(); i++) {
+                            excludes[i] = playlist.indexOf(shuffleHistory.get(i));
+                        }
+                        int random = Utils.getRandomWithExclusion(0, playlist.size() - 1, excludes);
+                        currentSong = playlist.get(random);
+                        open(currentSong);
+                        play();
+                    } else {
+                        shuffleHistory.clear();
+                        if (Boolean.TRUE.equals(repeatMode)) {
+                            int random = Utils.getRandomWithExclusion(0, playlist.size() - 1, current);
                             currentSong = playlist.get(random);
                             open(currentSong);
                             play();
                         } else {
-                            shuffleHistory.clear();
-                            if (Boolean.TRUE.equals(repeatMode)) {
-                                int random = Utils.getRandomWithExclusion(0, playlist.size() - 1, current);
-                                currentSong = playlist.get(random);
-                                open(currentSong);
-                                play();
-                            } else {
-                                stop();
-                            }
-                        }
-                    } else {
-                        if (current == playlist.size() - 1) {
-                            if (Boolean.TRUE.equals(repeatMode)) {
-                                next(false);
-                            } else {
-                                advanceAndStop(false);
-                            }
-                        } else if (current < playlist.size() - 1) {
-                            currentSong = playlist.get(current + 1);
-                            open(currentSong);
-                            play();
+                            stop();
                         }
                     }
+                } else {
+                    if (current == playlist.size() - 1) {
+                        if (Boolean.TRUE.equals(repeatMode)) {
+                            next(false);
+                        } else {
+                            advanceAndStop(false);
+                        }
+                    } else if (current < playlist.size() - 1) {
+                        currentSong = playlist.get(current + 1);
+                        open(currentSong);
+                        play();
+                    }
                 }
-            } catch (BasicPlayerException ex) {
-                Utils.log(MusicPlayer.class.getName(), ex);
             }
+        } catch (BasicPlayerException ex) {
+            Utils.log(MusicPlayer.class.getName(), ex);
         }
     }
 

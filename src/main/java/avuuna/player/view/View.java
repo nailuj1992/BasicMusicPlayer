@@ -35,8 +35,10 @@ public abstract class View extends JFrame implements Serializable {
      */
     public final void initView() {
         pack();
-        setVisible(true);
-        setResizable(false);
+        // Resizable, but never smaller than the packed layout so controls are not cut off.
+        setMinimumSize(getSize());
+        setResizable(true);
         setLocationRelativeTo(null);
+        setVisible(true);
     }
 }

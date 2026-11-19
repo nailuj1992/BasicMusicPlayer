@@ -6,8 +6,10 @@ import javax.swing.*;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -15,6 +17,8 @@ public class Utils {
 
     public static final String NIMBUS_LOOK_AND_FEEL = "Nimbus";
     public static final String WINDOWS_LOOK_AND_FEEL = "Windows";
+
+    private static final Random RANDOM = new Random();
 
     public static void display() {
         System.out.println();
@@ -92,20 +96,27 @@ public class Utils {
         return errors.toString();
     }
 
+    /**
+     * Returns a random int in {@code [start, end]} that is not in {@code exclude}.
+     * Picks from the remaining candidates directly, so it always terminates.
+     *
+     * @throws IllegalArgumentException if every value in the range is excluded
+     */
     public static int getRandomWithExclusion(int start, int end, int... exclude) {
-        Random rand = new Random();
-        int range = end - start + 1;
-
-        List<Integer> excludes = new ArrayList<Integer>();
+        Set<Integer> excludes = new HashSet<>();
         for (int ex : exclude) {
             excludes.add(ex);
         }
 
-        int random = rand.nextInt(range);
-        while (excludes.contains(random)) {
-            random = rand.nextInt(range);
+        List<Integer> candidates = new ArrayList<>();
+        for (int i = start; i <= end; i++) {
+            if (!excludes.contains(i)) {
+                candidates.add(i);
+            }
         }
-
-        return random;
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException("All values in [" + start + ", " + end + "] are excluded");
+        }
+        return candidates.get(RANDOM.nextInt(candidates.size()));
     }
 }
