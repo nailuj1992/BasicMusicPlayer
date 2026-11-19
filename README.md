@@ -42,7 +42,7 @@ cp target/reproductor-musica-*.jar target/dependency/
 "$JAVA_HOME/bin/jpackage" \
   --type app-image \
   --name MusicPlayer \
-  --app-version 2.0.0 \
+  --app-version 2.1.0 \
   --vendor Avuuna \
   --input target/dependency \
   --main-jar reproductor-musica-1.0-SNAPSHOT.jar \
@@ -60,8 +60,8 @@ app image, zips it, and publishes a GitHub Release using the matching section
 of `CHANGELOG.md` as the release notes.
 
 ```bash
-git tag v2.0.0
-git push origin v2.0.0
+git tag v2.1.0
+git push origin v2.1.0
 ```
 
 ## Architecture
