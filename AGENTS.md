@@ -39,13 +39,14 @@ Lightweight **Windows desktop music player** in Java / Swing: MP3 playback, play
 | `model/MusicPlayer` | Playlist, current song, playback state, repeat/shuffle logic, end-of-song handling. Observer **subject**. Singleton. No Swing imports. |
 | `model/Song` | `extends File`, plus duration (µs) and audio byte length. Equality is `File` equality (path, case-insensitive on Windows). |
 | `model/BufferedBasicPlayer` | `BasicPlayer` subclass that reads the whole file into a `ByteArrayInputStream` (fixes "Resetting to invalid mark" with big ID3v2 tags). |
-| `model/SessionStore` | Saves/restores `playlist.m3u8` + `settings.properties` in `%APPDATA%\AvuunaMusicPlayer` (override: `-Dmusicplayer.dataDir=<dir>`). |
+| `model/PlaylistFile` | The **only** M3U/M3U8 reader/writer. Writes UTF-8 with `#EXTM3U`/`#EXTINF`, relative paths optional (atomic temp-file + move). Reads other players' files: skips comments and URLs, resolves relative paths and `file:` URIs, drops the BOM, falls back to Windows-1252 for non-UTF-8 `.m3u`. |
+| `model/SessionStore` | Saves/restores `playlist.m3u8` (through `PlaylistFile`, absolute paths) + `settings.properties` in `%APPDATA%\AvuunaMusicPlayer` (override: `-Dmusicplayer.dataDir=<dir>`). |
 | `view/View`, `view/GUIPlayer` | `JFrame` base and the main window. Exposes `addXListener(...)`, `bindShortcut(...)`, `setFileDropHandler(...)`, `addSeekListener(...)` and semantic setters (`setPlayingState`, `refreshPlaylist`, `updateControlState`, …). Imports nothing from `model`. |
 | `utils/Images` | Icons generated at runtime from Unicode glyphs (`Graphics2D`). Only `logo.png` and `Open16.png` are real image resources. |
 | `utils/Strings`, `exception/PlayerException` | All user-facing text (labels, tooltips, dialogs, error messages). |
 | `utils/Utils` | Time formatting, logging, Look and Feel, `getRandomWithExclusion`. |
 | `utils/ModelObserver`, `utils/ModelSubject` | The project's own Observer interfaces. |
-| `src/test/java/.../PlayerTest`, `UtilsTest`, `SessionStoreTest` | Tests (see *Testing*). `src/test/resources/music/` holds the sample MP3s. |
+| `src/test/java/.../PlayerTest`, `UtilsTest`, `SessionStoreTest`, `PlaylistFileTest` | Tests (see *Testing*). `src/test/resources/music/` holds the sample MP3s. |
 | `.github/workflows/release.yml` | Tag-triggered Windows build: `mvn package` (tests skipped), `jpackage --type app-image`, zip, GitHub Release with notes taken from `CHANGELOG.md`. |
 
 `utils/NetUtils` and several `Utils.display(...)` overloads are unused leftovers; remove them only as a deliberate cleanup, not in passing.
@@ -66,7 +67,8 @@ Lightweight **Windows desktop music player** in Java / Swing: MP3 playback, play
 - **Shuffle:** at least two songs; `getRandomWithExclusion` throws when everything is excluded (it used to loop forever). Next respects shuffle via `skipForward()`.
 - **User feedback:** prefer disabling controls (`updateControlState`) over error dialogs for "nothing selected / empty playlist". Confirm only destructive bulk actions (clearing the playlist). New user-facing text goes in `Strings`/`PlayerException`, and new shortcuts go in `bindShortcuts()`, in the tooltip text and in `Strings.SHORTCUTS_TEXT`.
 - **Layout gotcha:** a `JLabel`'s minimum width is its full text width. Labels holding dynamic text (song names) must be added to `GroupLayout` with min/pref `0`, or a long name pushes controls out of the window.
-- **File picker:** the PowerShell script must set `[Console]::OutputEncoding` to UTF-8 and Java must decode as UTF-8, or non-ASCII paths break. Extension checks are case-insensitive (`toLowerCase(Locale.ROOT)`).
+- **File pickers:** every native dialog goes through `GUIPlayer.runPowerShellDialog`, whose prelude sets `[Console]::OutputEncoding` to UTF-8 (Java decodes UTF-8), or non-ASCII paths break. Each one needs a Swing/AWT fallback when PowerShell fails. Extension checks are case-insensitive (`toLowerCase(Locale.ROOT)`).
+- **Playlist files:** saved playlists use relative paths (portable with their music); the session file uses absolute paths. Opening never clears the current songs before the file was read successfully and contains at least one usable MP3. Entries that are missing or not MP3 are skipped and reported in one message, not one dialog each.
 
 ## Build, run & test
 
@@ -95,7 +97,7 @@ java -cp "target/classes;target/dependency/*" avuuna.player.MainPlayer
 - Don't touch the maintainer's real data (`%APPDATA%\AvuunaMusicPlayer`) or music folders unless explicitly asked; back files up before overwriting them.
 - Don't publish anything (tags, releases, GitHub pages) and don't commit secrets (none exist today; keep it that way).
 - Don't commit `target/`, `.idea/`, `.claude/` or generated session files. Note: `.gitignore` ignores `*.jar`, yet `libs/*.jar` is tracked from older history; leave it until a cleanup is requested.
-- Don't claim OGG support works: the README lists it, but the file picker, drop handler and progress keys are MP3-only today.
+- Don't claim OGG support works: `vorbisspi` is bundled, but the file picker, drop handler, playlist import and progress keys are MP3-only today.
 - Windows shell: both PowerShell and Git Bash are available; working-tree files are LF with `core.autocrlf=true`. Don't mass-convert line endings.
 
 ## Documentation & releases

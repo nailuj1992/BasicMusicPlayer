@@ -6,10 +6,17 @@ seeking, repeat / shuffle modes, and a multi-selection playlist.
 
 ## Features
 
-- **MP3** and **OGG Vorbis** playback (via `mp3spi` and `vorbisspi`).
-- **Native Windows 11 file picker** (PowerShell `OpenFileDialog`), with the
-  legacy `java.awt.FileDialog` as automatic fallback.
-- **Click-to-seek** on the progress bar — accurate even for files with large
+- **MP3** playback (via `mp3spi`). `vorbisspi` is bundled, but OGG files can't be
+  added from the UI yet.
+- **Playlist files** — save the playlist as `.m3u8` / `.m3u` and open playlists
+  written by this or other players (replace the current songs or add to them).
+- **Session restore** — playlist, current song, volume, repeat and shuffle come back
+  on the next start (`%APPDATA%\AvuunaMusicPlayer`).
+- **Drag and drop** MP3 files, folders or playlist files onto the window.
+- **Keyboard shortcuts** for everything (see **Help > Keyboard shortcuts**, F1).
+- **Native Windows 11 file pickers** (PowerShell `OpenFileDialog` / `SaveFileDialog`),
+  with Swing/AWT dialogs as automatic fallback.
+- **Click or drag to seek** on the progress bar — accurate even for files with large
   ID3v2 tags (embedded album art, lyrics, etc.).
 - **Repeat** modes: none / all / one. **Shuffle** mode with history tracking.
 - **Multi-selection playlist** (`Ctrl` + click, `Shift` + click) — remove or

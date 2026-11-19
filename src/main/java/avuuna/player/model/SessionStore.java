@@ -66,13 +66,8 @@ public class SessionStore {
 
     public void save(Session session) throws IOException {
         Files.createDirectories(dir);
-
-        List<String> lines = new ArrayList<>();
-        lines.add("#EXTM3U");
-        for (Path song : session.songs()) {
-            lines.add(song.toAbsolutePath().toString());
-        }
-        Files.write(dir.resolve(PLAYLIST_FILE), lines, StandardCharsets.UTF_8);
+        // Absolute paths: the session file lives in %APPDATA%, far from the music.
+        PlaylistFile.write(dir.resolve(PLAYLIST_FILE), session.songs(), false);
 
         Properties props = new Properties();
         props.setProperty(KEY_CURRENT, Integer.toString(session.currentIndex()));
@@ -103,12 +98,7 @@ public class SessionStore {
         Path playlist = dir.resolve(PLAYLIST_FILE);
         if (Files.isRegularFile(playlist)) {
             try {
-                for (String line : Files.readAllLines(playlist, StandardCharsets.UTF_8)) {
-                    String trimmed = line.strip();
-                    if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
-                        saved.add(Paths.get(trimmed));
-                    }
-                }
+                saved.addAll(PlaylistFile.read(playlist));
             } catch (IOException | RuntimeException ignored) {
                 saved.clear();
             }

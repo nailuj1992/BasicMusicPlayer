@@ -13,6 +13,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,8 +34,21 @@ public class GUIPlayer extends View {
     /** One row of the playlist as shown to the user. */
     public record PlaylistItem(String title, String tooltip) {}
 
+    /** What to do with the current songs when opening a playlist file. */
+    public enum PlaylistOpenMode { REPLACE, ADD }
+
+    private static final String PS_PRELUDE =
+            // Force UTF-8 output: PowerShell defaults to the OEM codepage, which
+            // garbles non-ASCII paths (e.g. "Canción.mp3") when decoded by Java.
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            + "Add-Type -AssemblyName System.Windows.Forms; ";
+    private static final String PS_PLAYLIST_FILTER =
+            "Playlists (*.m3u8;*.m3u)|*.m3u8;*.m3u|All files (*.*)|*.*";
+
     private JMenuItem openItem;
     private JMenuItem openFolderItem;
+    private JMenuItem openPlaylistItem;
+    private JMenuItem savePlaylistItem;
     private JMenuItem exitItem;
     private JMenuItem shortcutsItem;
     private JMenuItem aboutItem;
@@ -92,6 +106,22 @@ public class GUIPlayer extends View {
 
     public void setOpenFolderMenuAccelerator(KeyStroke ks) {
         openFolderItem.setAccelerator(ks);
+    }
+
+    public void addOpenPlaylistMenuListener(ActionListener l) {
+        openPlaylistItem.addActionListener(l);
+    }
+
+    public void setOpenPlaylistMenuAccelerator(KeyStroke ks) {
+        openPlaylistItem.setAccelerator(ks);
+    }
+
+    public void addSavePlaylistMenuListener(ActionListener l) {
+        savePlaylistItem.addActionListener(l);
+    }
+
+    public void setSavePlaylistMenuAccelerator(KeyStroke ks) {
+        savePlaylistItem.setAccelerator(ks);
     }
 
     public void addExitMenuListener(ActionListener l) {
@@ -348,6 +378,7 @@ public class GUIPlayer extends View {
         moveUpButton.setEnabled(hasSelection);
         moveDownButton.setEnabled(hasSelection);
         clearButton.setEnabled(hasSongs);
+        savePlaylistItem.setEnabled(hasSongs);
     }
 
     // -------------------------------------------------------------------------
@@ -433,38 +464,103 @@ public class GUIPlayer extends View {
         return chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION ? chooser.getSelectedFile() : null;
     }
 
+    /**
+     * Asks whether an opened playlist replaces the current songs or is appended.
+     * Returns {@code null} if the user cancels.
+     */
+    public PlaylistOpenMode askReplaceOrAdd(String playlistName) {
+        Object[] options = {Strings.REPLACE_OPTION, Strings.ADD_OPTION, Strings.CANCEL_OPTION};
+        int choice = JOptionPane.showOptionDialog(this,
+                String.format(Strings.REPLACE_OR_ADD_MSG, playlistName), Strings.REPLACE_OR_ADD_TITLE,
+                JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+        if (choice == 0) return PlaylistOpenMode.REPLACE;
+        if (choice == 1) return PlaylistOpenMode.ADD;
+        return null;
+    }
+
+    /** Native Windows picker for MP3 files (multi-select). Returns {@code null} if cancelled. */
     public File[] showOpenDialog() {
         try {
-            // Force UTF-8 output: PowerShell defaults to the OEM codepage, which
-            // garbles non-ASCII paths (e.g. "Canción.mp3") when decoded by Java.
-            String script =
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
-                "Add-Type -AssemblyName System.Windows.Forms; " +
+            String output = runPowerShellDialog(
                 "$d = New-Object System.Windows.Forms.OpenFileDialog; " +
                 "$d.Filter = 'MP3 Files (*.mp3)|*.mp3'; " +
                 "$d.Multiselect = $true; " +
-                "$d.Title = 'Open'; " +
-                "if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join [System.Environment]::NewLine }";
-
-            Process process = new ProcessBuilder("powershell", "-NoProfile", "-STA", "-Command", script)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start();
-
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-            int exitCode = process.waitFor();
-
-            if (exitCode != 0) {
-                return showLegacyOpenDialog();
+                "$d.Title = '" + Strings.ADD_SONGS_DIALOG_TITLE + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join [System.Environment]::NewLine }");
+            if (output.isEmpty()) {
+                return null; // user cancelled
             }
-            if (!output.isEmpty()) {
-                return Arrays.stream(output.split("\\r?\\n"))
-                    .map(File::new)
-                    .toArray(File[]::new);
-            }
-            return null; // user cancelled
+            return Arrays.stream(output.split("\\r?\\n")).map(File::new).toArray(File[]::new);
         } catch (Exception ignored) {
             return showLegacyOpenDialog();
         }
+    }
+
+    /** Native Windows picker for one .m3u8/.m3u file. Returns {@code null} if cancelled. */
+    public File showOpenPlaylistDialog() {
+        try {
+            String output = runPowerShellDialog(
+                "$d = New-Object System.Windows.Forms.OpenFileDialog; " +
+                "$d.Filter = '" + PS_PLAYLIST_FILTER + "'; " +
+                "$d.Title = '" + Strings.OPEN_PLAYLIST_ITEM.replace("...", "") + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileName }");
+            return output.isEmpty() ? null : new File(output);
+        } catch (Exception ignored) {
+            JFileChooser chooser = playlistChooser(Strings.OPEN_PLAYLIST_ITEM);
+            return chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION ? chooser.getSelectedFile() : null;
+        }
+    }
+
+    /**
+     * Native Windows "Save as" for a playlist (asks before overwriting). Returns {@code null}
+     * if cancelled. The extension may be missing when the fallback chooser is used.
+     */
+    public File showSavePlaylistDialog() {
+        try {
+            String output = runPowerShellDialog(
+                "$d = New-Object System.Windows.Forms.SaveFileDialog; " +
+                "$d.Filter = 'M3U8 playlist (*.m3u8)|*.m3u8|M3U playlist (*.m3u)|*.m3u'; " +
+                "$d.DefaultExt = 'm3u8'; $d.AddExtension = $true; $d.OverwritePrompt = $true; " +
+                "$d.FileName = '" + Strings.DEFAULT_PLAYLIST_NAME + "'; " +
+                "$d.Title = '" + Strings.SAVE_PLAYLIST_ITEM.replace("...", "") + "'; " +
+                "if ($d.ShowDialog() -eq 'OK') { $d.FileName }");
+            return output.isEmpty() ? null : new File(output);
+        } catch (Exception ignored) {
+            JFileChooser chooser = playlistChooser(Strings.SAVE_PLAYLIST_ITEM);
+            chooser.setSelectedFile(new File(Strings.DEFAULT_PLAYLIST_NAME + ".m3u8"));
+            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+                return null;
+            }
+            File file = chooser.getSelectedFile();
+            if (file.exists() && !confirm(String.format(Strings.CONFIRM_OVERWRITE_MSG, file.getName()))) {
+                return null;
+            }
+            return file;
+        }
+    }
+
+    private static JFileChooser playlistChooser(String title) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle(title);
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                Strings.PLAYLIST_FILES_FILTER, "m3u8", "m3u"));
+        return chooser;
+    }
+
+    /**
+     * Runs a Windows Forms dialog script in PowerShell and returns what it printed
+     * (empty when the user cancelled). Throws if PowerShell is unavailable or fails,
+     * so callers can fall back to a Swing/AWT dialog.
+     */
+    private static String runPowerShellDialog(String script) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder("powershell", "-NoProfile", "-STA", "-Command", PS_PRELUDE + script)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        if (process.waitFor() != 0) {
+            throw new IOException("PowerShell dialog failed");
+        }
+        return output;
     }
 
     private File[] showLegacyOpenDialog() {
@@ -503,6 +599,11 @@ public class GUIPlayer extends View {
         fileMenu.add(openItem);
         openFolderItem = new JMenuItem(Strings.OPEN_FOLDER_ITEM);
         fileMenu.add(openFolderItem);
+        fileMenu.addSeparator();
+        openPlaylistItem = new JMenuItem(Strings.OPEN_PLAYLIST_ITEM);
+        fileMenu.add(openPlaylistItem);
+        savePlaylistItem = new JMenuItem(Strings.SAVE_PLAYLIST_ITEM);
+        fileMenu.add(savePlaylistItem);
         fileMenu.addSeparator();
         exitItem = new JMenuItem(Strings.EXIT_ITEM);
         fileMenu.add(exitItem);

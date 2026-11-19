@@ -2,6 +2,7 @@ package avuuna.player.controller;
 
 import avuuna.player.exception.PlayerException;
 import avuuna.player.model.MusicPlayer;
+import avuuna.player.model.PlaylistFile;
 import avuuna.player.model.SessionStore;
 import avuuna.player.model.SessionStore.Session;
 import avuuna.player.model.Song;
@@ -108,6 +109,10 @@ public class PlayerController implements Serializable, ModelObserver {
         view.setOpenFolderMenuAccelerator(KeyStroke.getKeyStroke("ctrl shift O"));
         view.addOpenMenuListener(e -> openSongDialog());
         view.addOpenFolderMenuListener(e -> openFolderDialog());
+        view.setOpenPlaylistMenuAccelerator(KeyStroke.getKeyStroke("ctrl L"));
+        view.setSavePlaylistMenuAccelerator(KeyStroke.getKeyStroke("ctrl shift S"));
+        view.addOpenPlaylistMenuListener(e -> openPlaylistDialog());
+        view.addSavePlaylistMenuListener(e -> savePlaylistDialog());
         view.addShortcutsMenuListener(e -> view.showShortcutsDialog());
         view.addAboutMenuListener(e -> view.showAboutDialog());
         view.addAddSongListener(e -> openSongDialog());
@@ -315,20 +320,92 @@ public class PlayerController implements Serializable, ModelObserver {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Playlist files
+    // -------------------------------------------------------------------------
+
+    /** File > Open playlist: asks Replace / Add when songs are already loaded. */
+    private void openPlaylistDialog() {
+        File file = view.showOpenPlaylistDialog();
+        if (file == null) {
+            return;
+        }
+        Expansion songs = new Expansion();
+        try {
+            songs.addPlaylist(PlaylistFile.read(file.toPath()));
+        } catch (IOException | RuntimeException ex) {
+            Utils.log(PlayerController.class.getName(), new IOException(ex));
+            view.showError(PlayerException.ERROR, String.format(Strings.FAILED_TO_READ_PLAYLIST, file.getName()));
+            return;
+        }
+
+        // Nothing usable in the file: report it without touching the current playlist.
+        if (!songs.mp3s.isEmpty() && model.getSongCount() > 0) {
+            GUIPlayer.PlaylistOpenMode mode = view.askReplaceOrAdd(file.getName());
+            if (mode == null) {
+                return;
+            }
+            if (mode == GUIPlayer.PlaylistOpenMode.REPLACE) {
+                try {
+                    model.clearPlaylist();
+                } catch (BasicPlayerException ex) {
+                    fail(PlayerException.ERROR_CLEAR_LIST, ex);
+                    return;
+                }
+            }
+        }
+        addExpanded(songs);
+    }
+
+    /** File > Save playlist as: writes the current songs as .m3u8 (or .m3u). */
+    private void savePlaylistDialog() {
+        if (model.getSongCount() == 0) {
+            return;
+        }
+        File file = view.showSavePlaylistDialog();
+        if (file == null) {
+            return;
+        }
+        if (!PlaylistFile.isPlaylist(file)) {
+            file = new File(file.getPath() + PlaylistFile.M3U8);
+        }
+        List<Path> songs = model.getSongs().stream().map(File::toPath).toList();
+        try {
+            // Relative paths keep the playlist working if its folder is moved with the music.
+            PlaylistFile.write(file.toPath(), songs, true);
+        } catch (IOException | RuntimeException ex) {
+            Utils.log(PlayerController.class.getName(), new IOException(ex));
+            view.showError(PlayerException.ERROR, String.format(Strings.FAILED_TO_SAVE_PLAYLIST, file.getName()));
+        }
+    }
+
     /**
-     * Adds files and (recursively) the MP3s inside folders. Duplicates are skipped.
-     * If nothing was loaded yet, the first added song starts playing.
+     * Adds files, the MP3s inside folders (recursively) and the songs listed in dropped
+     * playlist files. Duplicates are skipped. If nothing was loaded yet, the first added
+     * song starts playing.
      */
     private void addFiles(List<File> files) {
-        List<File> mp3s = expandToMp3s(files);
-        if (mp3s.isEmpty()) {
-            view.showInfo(Strings.NO_MP3_FOUND);
+        addExpanded(expand(files));
+    }
+
+    private void addExpanded(Expansion found) {
+        List<String> notes = new ArrayList<>();
+        if (found.skipped > 0) {
+            notes.add(String.format(Strings.SKIPPED_PLAYLIST_ENTRIES, found.skipped,
+                    found.skipped == 1 ? "y was" : "ies were"));
+        }
+        if (found.unreadable > 0) {
+            notes.add(String.format(Strings.UNREADABLE_PLAYLISTS, found.unreadable));
+        }
+        if (found.mp3s.isEmpty()) {
+            notes.add(0, Strings.NO_MP3_FOUND);
+            view.showInfo(String.join("\n", notes));
             return;
         }
 
         int duplicates = 0;
         int firstAdded = -1;
-        for (File f : mp3s) {
+        for (File f : found.mp3s) {
             try {
                 model.addSong(new Song(f.getAbsolutePath()));
                 if (firstAdded < 0) {
@@ -340,7 +417,12 @@ public class PlayerController implements Serializable, ModelObserver {
         }
 
         if (firstAdded < 0) {
-            view.showInfo(String.format(Strings.SKIPPED_DUPLICATES, duplicates));
+            notes.add(0, String.format(Strings.SKIPPED_DUPLICATES, duplicates));
+        }
+        if (!notes.isEmpty()) {
+            view.showInfo(String.join("\n", notes));
+        }
+        if (firstAdded < 0) {
             return;
         }
         if (model.getCurrentSong() == null) {
@@ -358,8 +440,28 @@ public class PlayerController implements Serializable, ModelObserver {
         view.setSelectedIndex(firstAdded);
     }
 
-    private static List<File> expandToMp3s(List<File> files) {
-        List<File> result = new ArrayList<>();
+    /** What a set of dropped/selected files expands to. */
+    private static final class Expansion {
+        final List<File> mp3s = new ArrayList<>();
+        /** Playlist entries that point to a missing file or a non-MP3. */
+        int skipped;
+        /** Playlist files that could not be read. */
+        int unreadable;
+
+        void addPlaylist(List<Path> entries) {
+            for (Path entry : entries) {
+                File f = entry.toFile();
+                if (f.isFile() && isMp3(f)) {
+                    mp3s.add(f);
+                } else {
+                    skipped++;
+                }
+            }
+        }
+    }
+
+    private static Expansion expand(List<File> files) {
+        Expansion result = new Expansion();
         for (File f : files) {
             if (f.isDirectory()) {
                 try (Stream<Path> walk = Files.walk(f.toPath(), MAX_FOLDER_DEPTH)) {
@@ -367,12 +469,19 @@ public class PlayerController implements Serializable, ModelObserver {
                         .map(Path::toFile)
                         .filter(PlayerController::isMp3)
                         .sorted()
-                        .forEach(result::add);
+                        .forEach(result.mp3s::add);
                 } catch (IOException | RuntimeException ex) {
                     Utils.log(PlayerController.class.getName(), new IOException(ex));
                 }
+            } else if (PlaylistFile.isPlaylist(f)) {
+                try {
+                    result.addPlaylist(PlaylistFile.read(f.toPath()));
+                } catch (IOException | RuntimeException ex) {
+                    Utils.log(PlayerController.class.getName(), new IOException(ex));
+                    result.unreadable++;
+                }
             } else if (isMp3(f)) {
-                result.add(f);
+                result.mp3s.add(f);
             }
         }
         return result;

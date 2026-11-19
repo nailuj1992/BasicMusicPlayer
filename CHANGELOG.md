@@ -12,9 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Playlist, current song, volume, repeat and shuffle are saved on exit and restored
   on start (`%APPDATA%\AvuunaMusicPlayer`; override with `-Dmusicplayer.dataDir`).
-- Drag and drop MP3 files or whole folders onto the window; **File > Open folder...**.
+- Playlist files: **File > Save playlist as...** (Ctrl+Shift+S) writes an M3U8 (UTF-8,
+  paths relative to the playlist's folder when the songs are inside it) or M3U file;
+  **File > Open playlist...** (Ctrl+L) reads `.m3u8` / `.m3u` files written by this or
+  other players and asks whether to replace the current songs or add to them. Missing
+  files and non-MP3 entries are skipped and reported.
+- Drag and drop MP3 files, whole folders or playlist files onto the window;
+  **File > Open folder...**.
 - Keyboard shortcuts: Space, Enter, Delete, Ctrl+Left/Right, Shift+Left/Right (±5 s),
-  Ctrl+Up/Down, Ctrl+R, Ctrl+S, Ctrl+Shift+O; listed under **Help > Keyboard shortcuts** (F1).
+  Ctrl+Up/Down, Ctrl+R, Ctrl+S, Ctrl+Shift+O, Ctrl+L, Ctrl+Shift+S; listed under
+  **Help > Keyboard shortcuts** (F1).
 - Drag on the progress bar to scrub; the time preview follows the mouse and the
   seek happens on release.
 - Volume percentage label; mouse wheel adjusts volume.
@@ -32,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removing the current song while stopped loads the next one without starting playback;
   removing several songs at once no longer opens songs one after another.
 - The window is resizable; buttons are keyboard-focusable and have accessible names.
+- README: OGG is no longer listed as supported (it can't be added from the UI yet).
 
 ### Fixed
 - Playlist actions use positions instead of file names, so two songs with the same file

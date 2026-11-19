@@ -7,6 +7,11 @@ public class Strings {
     public static final String FILE_MENU = "File";
     public static final String OPEN_ITEM = "Open...";
     public static final String OPEN_FOLDER_ITEM = "Open folder...";
+    public static final String OPEN_PLAYLIST_ITEM = "Open playlist...";
+    public static final String SAVE_PLAYLIST_ITEM = "Save playlist as...";
+    public static final String ADD_SONGS_DIALOG_TITLE = "Add songs";
+    public static final String PLAYLIST_FILES_FILTER = "Playlists (*.m3u8, *.m3u)";
+    public static final String DEFAULT_PLAYLIST_NAME = "Playlist";
     public static final String EXIT_ITEM = "Exit";
     public static final String HELP_MENU = "Help";
     public static final String SHORTCUTS_ITEM = "Keyboard shortcuts";
@@ -38,7 +43,7 @@ public class Strings {
     public static final String VOLUME_TOOLTIP = "Volume (scroll to adjust)";
     public static final String SEEK_TOOLTIP = "Click or drag to seek (Shift+Left/Right: ±5 s)";
 
-    public static final String EMPTY_PLAYLIST_LINE1 = "Drop MP3 files or folders here";
+    public static final String EMPTY_PLAYLIST_LINE1 = "Drop MP3 files, folders or playlists here";
     public static final String EMPTY_PLAYLIST_LINE2 = "or press + to add songs";
 
     public static final String OF = " / ";
@@ -51,6 +56,18 @@ public class Strings {
     public static final String SKIPPED_DUPLICATES = "%d song(s) were already in the playlist and were skipped.";
     public static final String FAILED_TO_OPEN = "%d file(s) could not be opened.";
     public static final String NO_MP3_FOUND = "No MP3 files were found in what you added.";
+    public static final String SKIPPED_PLAYLIST_ENTRIES =
+            "%d playlist entr%s skipped (file not found or not an MP3).";
+    public static final String FAILED_TO_READ_PLAYLIST = "The playlist file could not be read:\n%s";
+    public static final String UNREADABLE_PLAYLISTS = "%d playlist file(s) could not be read.";
+    public static final String FAILED_TO_SAVE_PLAYLIST = "The playlist could not be saved:\n%s";
+    public static final String REPLACE_OR_ADD_TITLE = "Open playlist";
+    public static final String REPLACE_OR_ADD_MSG =
+            "Replace the current playlist with \"%s\", or add its songs to the end?";
+    public static final String REPLACE_OPTION = "Replace";
+    public static final String ADD_OPTION = "Add";
+    public static final String CANCEL_OPTION = "Cancel";
+    public static final String CONFIRM_OVERWRITE_MSG = "\"%s\" already exists. Replace it?";
 
     public static final String SHORTCUTS_TEXT =
             "<html><table cellpadding='2'>"
@@ -62,8 +79,10 @@ public class Strings {
             + "<tr><td><b>Delete</b></td><td>Remove selected songs</td></tr>"
             + "<tr><td><b>Ctrl+O</b></td><td>Add songs</td></tr>"
             + "<tr><td><b>Ctrl+Shift+O</b></td><td>Add a folder</td></tr>"
+            + "<tr><td><b>Ctrl+L</b></td><td>Open a playlist (.m3u8 / .m3u)</td></tr>"
+            + "<tr><td><b>Ctrl+Shift+S</b></td><td>Save the playlist</td></tr>"
             + "<tr><td><b>Ctrl+R / Ctrl+S</b></td><td>Cycle repeat / toggle shuffle</td></tr>"
-            + "</table><br>You can also drag files or folders onto the window.</html>";
+            + "</table><br>You can also drag files, folders or playlists onto the window.</html>";
 
     public static final String ABOUT_TEXT =
             "<html><b>Music Player</b><br>by Avuuna, la Luz del Alba<br><br>"
